@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">GolBolivia Live</string>
+    <string name="nav_live">En Vivo</string>
+    <string name="nav_iptv">Canales IPTV</string>
+    <string name="nav_clubs">Zona Clubes</string>
+    <string name="nav_vip">Donar / VIP</string>
+    <string name="live_badge">EN VIVO</string>
+    <string name="tab_chat">Chat en Vivo</string>
+    <string name="tab_stats">Estadísticas</string>
+    <string name="tab_events">Incidencias</string>
+    <string name="tab_poll">Encuesta</string>
+    <string name="reload_signal">Recargar Señal</string>
+    <string name="signal_principal">Señal HD</string>
+    <string name="signal_backup">Respaldo</string>
+    <string name="signal_radio">Radio / Demo</string>
+</resources>

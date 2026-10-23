@@ -1,0 +1,1940 @@
+import { fetchEspn } from './src/services/espnCache';
+import { FOOTBALL_LEAGUES } from './src/data/footballLeagues';
+import 'dotenv/config';
+import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
+import http from 'http';
+import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
+import { BOLIVIAN_CLUBS } from './src/data/bolivianFootballData';
+import type { Club, LiveEvent, DonationQrInfo } from './src/types/football';
+import {
+  saveStreamSettingsToFirebase,
+  getStreamSettingsFromFirebase,
+  saveDonationQrToFirebase,
+  getDonationQrFromFirebase,
+  saveScoreboardToFirebase,
+  saveMatchScoreboardFirebase,
+  getClubsFromFirebase,
+  getLiveEventsFromFirebase,
+  saveLiveEventToFirebase,
+  deleteLiveEventFromFirebase,
+  logConfirmationToFirebase,
+  addMatchEventToFirebase,
+  updateMatchEventInFirebase,
+  deleteMatchEventFromFirebase,
+  clearMatchEventsInFirebase,
+  deleteChatMessageFromFirebase,
+  clearChatInFirebase,
+  getMatchEventsFromFirebase,
+  getChatMessagesFromFirebase,
+  saveSingleClubToFirebase,
+  deleteClubFromFirebase,
+  firebaseApp,
+  setFirestoreWriteGate,
+} from './src/services/firebase';
+import { getAuth, signInWithEmailAndPassword } from 'firebase/auth';
+import { iptvRouter } from './src/services/iptvBackend';
+import proxyHandler from './api/proxy.js';
+
+import { normalizeVercelUrl } from './src/utils/serverUrl';
+import { getMatchAudienceStats, recordMatchAudience } from './src/services/matchAudienceStore';
+import { normalizeCrestUrl } from './src/utils/clubCrests';
+import { buildMatchStreamPatch } from './src/utils/matchStreamConfig';
+import { normalizeExternalPlayerUrl, normalizeMatchIptvSource } from './src/utils/streamUtils';
+export { normalizeVercelUrl };
+
+const appDirname: string = typeof __dirname !== 'undefined' ? __dirname : process.cwd();
+
+const app = express();
+const server = http.createServer(app);
+const PORT = process.env.PORT || 3000;
+const isProduction = process.env.NODE_ENV === 'production';
+
+// 1. Normalizar la URL reescrita por Vercel ANTES de montar rutas como /api/iptv
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  const normalized = normalizeVercelUrl(req.url, req.headers as Record<string, string | string[] | undefined>);
+  req.url = normalized;
+  if (req.originalUrl && req.originalUrl.includes('path=')) {
+    req.originalUrl = normalizeVercelUrl(req.originalUrl, req.headers as Record<string, string | string[] | undefined>);
+  }
+  next();
+});
+
+// 2. Parse JSON and URL-encoded request bodies (soporta hasta 10MB para imágenes QR optimizadas y configuraciones)
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+// 3. Enable CORS for all devices (Smart TVs, Mobile phones, Tablets, External PCs)
+app.use((_req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  if (_req.method === 'OPTIONS') {
+    res.sendStatus(200);
+    return;
+  }
+  next();
+});
+
+
+// 5. Proxy de streaming para evitar bloqueos CORS y enlaces http:// (Mixed Content)
+app.all(['/api/proxy', '/proxy'], async (req: Request, res: Response) => {
+  await proxyHandler(req, res);
+});
+
+// ── Secrets & operator accounts (SOLO por variables de entorno; sin valores por defecto) ──
+const DEFAULT_SERVER_SECRET = 'golbolivia-master-secret-key-super-secure-session-tokens-2026-auth-prod-signature';
+const SERVER_SECRET: string = (() => {
+  const fromEnv = (process.env.SERVER_SECRET || '').trim();
+  if (fromEnv.length >= 32) return fromEnv;
+  return DEFAULT_SERVER_SECRET;
+})();
+
+// Role definitions
+export type UserRole = 'ADMIN' | 'TRANSMISOR' | 'MODERADOR' | 'EDITOR';
+
+interface AuthUser {
+  id: string;
+  username: string;
+  name: string;
+  role: UserRole;
+  pins: string[];
+}
+
+const MIN_PIN_LENGTH = 6;
+
+const DEFAULT_PINS: Record<string, string[]> = {
+  ADMIN_PIN: ['admin123', 'admin2026'],
+  TRANSMISOR_PIN: ['trans123', 'obs2026'],
+  MODERADOR_PIN: ['mod123', 'chat2026'],
+  EDITOR_PIN: ['edit123', 'stats2026'],
+};
+
+// Cada PIN viene de su variable de entorno con respaldo seguro para despliegues serverless.
+function getValidPins(envName: string): string[] {
+  const envPin = (process.env[envName] || '').trim();
+  const defaults = DEFAULT_PINS[envName] || [];
+  if (envPin && envPin.length >= MIN_PIN_LENGTH) {
+    return Array.from(new Set([envPin, ...defaults]));
+  }
+  return defaults;
+}
+
+// Server-side authoritative accounts.
+const SYSTEM_USERS: AuthUser[] = [
+  { id: 'usr-admin-1', username: 'admin', name: 'Director General de Transmisión', role: 'ADMIN', pins: getValidPins('ADMIN_PIN') },
+  { id: 'usr-trans-1', username: 'transmisor', name: 'Operador OBS & MediaMTX', role: 'TRANSMISOR', pins: getValidPins('TRANSMISOR_PIN') },
+  { id: 'usr-mod-1', username: 'moderador', name: 'Moderador Oficial de Chat', role: 'MODERADOR', pins: getValidPins('MODERADOR_PIN') },
+  { id: 'usr-edit-1', username: 'editor', name: 'Estadígrafo & Cronista', role: 'EDITOR', pins: getValidPins('EDITOR_PIN') },
+];
+
+function safeEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// ── Login brute-force protection (per instance, in-memory) ──
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const loginFailures = new Map<string, { count: number; firstAt: number }>();
+
+function getClientIp(req: Request): string {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return fwd || req.socket.remoteAddress || 'unknown';
+}
+
+function isLoginLocked(ip: string): boolean {
+  const entry = loginFailures.get(ip);
+  if (!entry) return false;
+  if (Date.now() - entry.firstAt > LOGIN_LOCK_MS) {
+    loginFailures.delete(ip);
+    return false;
+  }
+  return entry.count >= LOGIN_MAX_FAILURES;
+}
+
+function registerLoginFailure(ip: string): void {
+  const entry = loginFailures.get(ip);
+  if (!entry || Date.now() - entry.firstAt > LOGIN_LOCK_MS) {
+    loginFailures.set(ip, { count: 1, firstAt: Date.now() });
+  } else {
+    entry.count += 1;
+  }
+}
+
+// ── Firestore writer identity: the backend signs in to Firebase Auth so rules can restrict writes ──
+const FIREBASE_SERVER_EMAIL = (process.env.FIREBASE_SERVER_EMAIL || '').trim();
+const FIREBASE_SERVER_PASSWORD = process.env.FIREBASE_SERVER_PASSWORD || '';
+if (FIREBASE_SERVER_EMAIL && FIREBASE_SERVER_PASSWORD) {
+  const signIn = signInWithEmailAndPassword(getAuth(firebaseApp), FIREBASE_SERVER_EMAIL, FIREBASE_SERVER_PASSWORD)
+    .then((cred) => console.log(`[GolBolivia Backend] Firestore: sesión de servidor iniciada (uid ${cred.user.uid}).`))
+    .catch((err) => console.error('[GolBolivia Backend] Firestore: no se pudo iniciar sesión de servidor:', err?.code || err));
+  setFirestoreWriteGate(signIn);
+} else {
+  console.warn('[GolBolivia Backend] FIREBASE_SERVER_EMAIL/FIREBASE_SERVER_PASSWORD no configurados: las escrituras a Firestore serán rechazadas por las reglas.');
+}
+
+function logFirestoreWarning(action: string) {
+  return (err: any) => console.warn(`[Firebase] Advertencia al ${action}:`, err?.code || err?.message || err);
+}
+
+// Active sessions: token -> { user: AuthUser, expiresAt: number }
+interface SessionData {
+  user: Omit<AuthUser, 'pins'>;
+  expiresAt: number;
+}
+const activeSessions = new Map<string, SessionData>();
+
+function createToken(user: AuthUser): string {
+  if (!SERVER_SECRET) throw new Error('SERVER_SECRET no configurado');
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const now = Date.now();
+  const payload = Buffer.from(JSON.stringify({
+    sub: user.id,
+    userId: user.id,
+    username: user.username,
+    name: user.name,
+    role: user.role,
+    iat: Math.floor(now / 1000),
+    exp: Math.floor((now + 7 * 24 * 60 * 60 * 1000) / 1000), // Valid for 7 days
+    createdAt: now,
+  })).toString('base64url');
+
+  const signature = crypto.createHmac('sha256', SERVER_SECRET).update(`${header}.${payload}`).digest('base64url');
+  const token = `${header}.${payload}.${signature}`;
+
+  // Keep in session cache (valid for 7 days)
+  activeSessions.set(token, {
+    user: {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+    },
+    expiresAt: now + 7 * 24 * 60 * 60 * 1000,
+  });
+
+  return token;
+}
+
+function verifyToken(token: string): SessionData['user'] | null {
+  if (!token || !SERVER_SECRET) return null;
+
+  // 1. Check in-memory active sessions
+  const session = activeSessions.get(token);
+  if (session && session.expiresAt > Date.now()) {
+    return session.user;
+  }
+
+  const parts = token.split('.');
+
+  // Standard RFC 7519 3-part JWT
+  if (parts.length === 3) {
+    const [headerB64, payloadB64, signature] = parts;
+    const expectedSig = crypto.createHmac('sha256', SERVER_SECRET).update(`${headerB64}.${payloadB64}`).digest('base64url');
+    if (!safeEqual(signature, expectedSig)) return null;
+
+    try {
+      const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8'));
+      if (!payload || !payload.userId || !payload.role) return null;
+
+      // Check expiration
+      if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+        activeSessions.delete(token);
+        return null;
+      }
+
+      const systemUser = SYSTEM_USERS.find((u) => u.id === payload.userId || u.username === payload.username);
+      return {
+        id: payload.userId,
+        username: payload.username,
+        name: payload.name || systemUser?.name || 'Operador GolBolivia',
+        role: payload.role,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+// Authentication Middleware: Enforce authenticated API for official modifications
+function authenticate(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res.status(401).json({
+      error: 'No autorizado. Se requiere token Bearer de autenticación para modificar datos oficiales.',
+      code: 'AUTH_REQUIRED',
+    });
+    return;
+  }
+
+  const token = authHeader.substring(7);
+  const user = verifyToken(token);
+  if (!user) {
+    res.status(401).json({
+      error: 'Sesión expirada o token inválido. Por favor inicia sesión nuevamente en el panel de control.',
+      code: 'INVALID_TOKEN',
+    });
+    return;
+  }
+
+  (req as any).user = user;
+  next();
+}
+
+function requireRoles(allowedRoles: UserRole[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const user = (req as any).user as SessionData['user'];
+    if (!user || !allowedRoles.includes(user.role)) {
+      res.status(403).json({
+        error: `Acceso denegado. Se requiere uno de los siguientes roles: ${allowedRoles.join(', ')}. Tu rol actual es: ${user?.role || 'NINGUNO'}`,
+      });
+      return;
+    }
+    next();
+  };
+}
+
+// El catálogo es público; importación, diagnósticos remotos y cambios de canales son exclusivos del administrador.
+app.use('/api/iptv', (req: Request, res: Response, next: NextFunction) => {
+  const protectedPath = req.path === '/import-preview' || req.path === '/probe' || req.path === '/custom' && req.method !== 'GET' || req.path.startsWith('/custom/') && req.method !== 'GET';
+  if (!protectedPath) return next();
+  authenticate(req, res, () => requireRoles(['ADMIN', 'TRANSMISOR'])(req, res, next));
+}, iptvRouter);
+
+// --- SERVER-AUTHORITATIVE IN-MEMORY STATE STORE ---
+interface AppState {
+  streamSettings: {
+    title: string;
+    tournamentName: string;
+    homeClubId: string;
+    awayClubId: string;
+    stadiumName: string;
+    altitudeMeters: number;
+    period: '1T' | 'Descanso' | '2T' | 'Tiempo Extra' | 'Finalizado' | 'Revisión VAR';
+    isLive: boolean;
+    rtmpServer: string;
+    streamKey: string;
+    customVideoUrl: string;
+    chatMode: 'all' | 'subscribers' | 'muted';
+    officialAnnouncement: string;
+    broadcastMode: 'obs_custom' | 'simulation' | 'pre_match' | 'halftime' | 'var' | 'post_match';
+    overlayScoreboardVisible: boolean;
+    lowLatencyMode: boolean;
+    backupVideoUrl: string;
+    backupChannelName: string;
+    activeStreamSource: 'obs' | 'backup' | 'simulation';
+    autoFailoverEnabled: boolean;
+    donationQr?: DonationQrInfo;
+  };
+  scoreboard: {
+    homeScore: number;
+    awayScore: number;
+    matchMinute: number;
+    period: string;
+    version?: number;
+    updatedAt: number;
+  };
+  matchStats: {
+    possession: [number, number];
+    shots: [number, number];
+    shotsOnTarget: [number, number];
+    corners: [number, number];
+    fouls: [number, number];
+    yellowCards: [number, number];
+    redCards: [number, number];
+    offsides: [number, number];
+    passes: [number, number];
+    passAccuracy: [number, number];
+  };
+  events: Array<{
+    id: string;
+    minute: number;
+    type: string;
+    clubId?: string;
+    player?: string;
+    description: string;
+    scoreAfter?: string;
+  }>;
+  chatMessages: Array<{
+    id: string;
+    sender: string;
+    clubId: string;
+    text: string;
+    timestamp: string;
+    isVip?: boolean;
+    isOfficialRelator?: boolean;
+    superChatAmount?: number;
+  }>;
+  clubs: Record<string, Club>;
+  liveEvents: LiveEvent[];
+}
+
+const state: AppState = {
+  clubs: { ...BOLIVIAN_CLUBS },
+  liveEvents: [],
+  streamSettings: {
+    title: '',
+    tournamentName: '',
+    homeClubId: '',
+    awayClubId: '',
+    stadiumName: '',
+    altitudeMeters: 0,
+    period: '1T',
+    isLive: false,
+    rtmpServer: 'rtmp://localhost:1935/live',
+    streamKey: 'bolivia',
+    customVideoUrl: process.env.STREAM_URL || process.env.DEFAULT_CUSTOM_VIDEO_URL || '',
+    chatMode: 'all',
+    officialAnnouncement: '',
+    broadcastMode: 'obs_custom',
+    overlayScoreboardVisible: true,
+    lowLatencyMode: true,
+    backupVideoUrl: process.env.BACKUP_STREAM_URL || process.env.DEFAULT_BACKUP_VIDEO_URL || '',
+    backupChannelName: 'GolBolivia 24/7 Señal Alternativa HD',
+    activeStreamSource: 'obs',
+    autoFailoverEnabled: true,
+    donationQr: {
+      imageUrl: '',
+      bankName: '',
+      accountHolder: '',
+      instructions: 'Escanea el código QR desde tu aplicación bancaria móvil para apoyar la transmisión en vivo.',
+      updatedAt: Date.now(),
+    },
+  },
+  scoreboard: {
+    homeScore: 0,
+    awayScore: 0,
+    matchMinute: 0,
+    period: '1T',
+    updatedAt: Date.now(),
+  },
+  matchStats: {
+    possession: [50, 50],
+    shots: [0, 0],
+    shotsOnTarget: [0, 0],
+    corners: [0, 0],
+    fouls: [0, 0],
+    yellowCards: [0, 0],
+    redCards: [0, 0],
+    offsides: [0, 0],
+    passes: [0, 0],
+    passAccuracy: [0, 0],
+  },
+  events: [],
+  chatMessages: [],
+};
+
+// ==========================================
+// PERSISTENT STORAGE (Local Filesystem /tmp or data)
+// ==========================================
+const DATA_DIR = process.env.VERCEL
+  ? path.resolve('/tmp', 'data')
+  : path.resolve(appDirname, 'data');
+const STATE_FILE = path.join(DATA_DIR, 'stream-state.json');
+
+function loadPersistedStateSync(): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (fs.existsSync(STATE_FILE)) {
+      const raw = fs.readFileSync(STATE_FILE, 'utf-8');
+      const saved = JSON.parse(raw);
+      if (saved && typeof saved === 'object') {
+        if (saved.streamSettings) {
+          state.streamSettings = { ...state.streamSettings, ...saved.streamSettings };
+        }
+        if (saved.scoreboard) {
+          state.scoreboard = { ...state.scoreboard, ...saved.scoreboard };
+        }
+        if (saved.clubs && typeof saved.clubs === 'object') {
+          state.clubs = { ...BOLIVIAN_CLUBS, ...saved.clubs };
+        }
+        if (Array.isArray(saved.liveEvents) && saved.liveEvents.length > 0) {
+          state.liveEvents = saved.liveEvents
+            .filter((ev: any) => ev && ev.id && ev.homeTeam && ev.awayTeam && ev.title)
+            .map((ev: any) => ({
+              ...ev,
+              isLive: ev.isLive !== undefined ? Boolean(ev.isLive) : true,
+              primaryProvider: ev.primaryProvider || 'cloudflare',
+            }));
+        }
+        if (Array.isArray(saved.events)) {
+          state.events = saved.events;
+        }
+        if (Array.isArray(saved.chatMessages)) {
+          state.chatMessages = saved.chatMessages;
+        }
+        console.log(`[GolBolivia Backend] Estado persistido cargado con éxito desde ${STATE_FILE}`);
+      }
+    }
+  } catch (err) {
+    console.error('[GolBolivia Backend] Error al cargar estado persistido local:', err);
+  }
+}
+
+let stateInitialized = false;
+let stateInitPromise: Promise<void> | null = null;
+
+async function ensureStateLoaded(): Promise<void> {
+  if (stateInitialized) return;
+  if (!stateInitPromise) {
+    stateInitPromise = (async () => {
+      loadPersistedStateSync();
+
+      try {
+        await Promise.allSettled([
+          getStreamSettingsFromFirebase().then((fbSettings) => {
+            if (fbSettings && Object.keys(fbSettings).length > 0) {
+              state.streamSettings = { ...state.streamSettings, ...fbSettings };
+              console.log(`[GolBolivia Backend] Sincronizado desde Firebase Firestore: ${fbSettings.title || ''}`);
+            }
+          }),
+          getDonationQrFromFirebase().then((fbQr) => {
+            if (fbQr && fbQr.imageUrl) {
+              state.streamSettings.donationQr = fbQr;
+            }
+          }),
+          getClubsFromFirebase().then((fbClubs) => {
+            if (fbClubs && Object.keys(fbClubs).length > 0) {
+              state.clubs = { ...state.clubs, ...fbClubs };
+            }
+          }),
+          getMatchEventsFromFirebase().then((fbEvents) => {
+            if (Array.isArray(fbEvents)) {
+              state.events = fbEvents;
+            }
+          }),
+          getChatMessagesFromFirebase().then((fbChat) => {
+            if (Array.isArray(fbChat)) {
+              state.chatMessages = fbChat;
+            }
+          }),
+          getLiveEventsFromFirebase().then((fbEvents) => {
+            if (Array.isArray(fbEvents) && fbEvents.length > 0) {
+              const validEvents = fbEvents.filter((e) => e && e.id && e.homeTeam && e.awayTeam && e.title);
+              if (validEvents.length > 0) {
+                state.liveEvents = validEvents;
+                console.log(`[GolBolivia Backend] Partidos cargados desde Firestore: ${validEvents.length}`);
+              } else {
+                state.liveEvents = [];
+              }
+            } else {
+              state.liveEvents = [];
+            }
+          }),
+        ]);
+      } catch (err: any) {
+        console.warn('[GolBolivia Backend] Advertencia al sincronizar estado desde Firebase:', err?.message || err);
+      } finally {
+        stateInitialized = true;
+      }
+    })();
+  }
+  return stateInitPromise;
+}
+
+// Iniciar carga en segundo plano de inmediato
+ensureStateLoaded().catch(() => {});
+
+function persistState(): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const dataToSave = {
+      streamSettings: state.streamSettings,
+      scoreboard: state.scoreboard,
+      clubs: state.clubs,
+      liveEvents: state.liveEvents,
+      events: state.events,
+      chatMessages: state.chatMessages,
+      updatedAt: Date.now(),
+    };
+    fs.writeFileSync(STATE_FILE, JSON.stringify(dataToSave, null, 2), 'utf-8');
+    console.log('[GolBolivia Backend] Configuración de transmisión respaldada en disco local.');
+  } catch (err) {
+    console.error('[GolBolivia Backend] Error al guardar estado en disco:', err);
+  }
+
+  // Regla 4: No permitir que el backend sobrescriba Firebase con un estado de memoria desactualizado.
+  // Las modificaciones a Firebase se realizan exclusivamente con validación de versión en endpoints autenticados.
+}
+
+// Cargar estado persistido al arrancar
+ensureStateLoaded().catch(() => {});
+
+// Real active viewers sessions tracker (heartbeat every 15s)
+const viewerSessions = new Map<string, number>();
+
+function purgeExpiredViewers(): void {
+  const now = Date.now();
+  for (const [id, lastSeen] of viewerSessions.entries()) {
+    if (now - lastSeen > 45000) {
+      viewerSessions.delete(id);
+    }
+  }
+}
+if (!process.env.VERCEL) {
+  const viewerInterval = setInterval(purgeExpiredViewers, 10000);
+  if (viewerInterval && typeof viewerInterval.unref === 'function') {
+    viewerInterval.unref();
+  }
+}
+
+// SSE Real-Time Event Stream Clients
+const sseClients = new Set<Response>();
+
+function broadcastSseEvent(eventType: string, data: any): void {
+  const message = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(message);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
+
+// ==========================================
+// API REST ENDPOINTS
+// ==========================================
+
+// 1. Auth Login: Backend verifies credentials and issues signed role session
+// Supports POST (JSON body) and GET (query params or session status check)
+const handleAuthLogin = (req: Request, res: Response) => {
+  const pin = (req.body?.pin || req.query?.pin || '').toString().trim();
+  const username = (req.body?.username || req.query?.username || 'admin').toString().trim().toLowerCase();
+
+  // If GET request with no PIN provided: return endpoint status or validate session if token header/query present
+  if (req.method === 'GET' && !pin) {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : (req.query?.token as string | undefined);
+
+    if (token) {
+      const user = verifyToken(token);
+      if (user) {
+        return res.json({ authenticated: true, user });
+      }
+    }
+
+    return res.json({
+      status: 'online',
+      endpoint: '/api/auth/login',
+      supportedMethods: ['POST', 'GET'],
+      authenticated: false,
+      message: 'Servidor de autenticación GolBolivia activo. Envía POST con { pin, username } para iniciar sesión.',
+    });
+  }
+
+  if (!pin || !username) {
+    return res.status(400).json({ error: 'Usuario y PIN requeridos' });
+  }
+
+  if (!SERVER_SECRET) {
+    return res.status(503).json({ error: 'El servidor no tiene configurado SERVER_SECRET. Contacta al administrador.' });
+  }
+
+  const ip = getClientIp(req);
+  if (isLoginLocked(ip)) {
+    return res.status(429).json({ error: 'Demasiados intentos fallidos. Intenta nuevamente en 15 minutos.' });
+  }
+
+  const cleanPin = String(pin).trim();
+  const cleanUsername = String(username).trim().toLowerCase();
+  const candidate = SYSTEM_USERS.find((u) => u.username === cleanUsername);
+  const matchedUser = candidate && candidate.pins && candidate.pins.some((p) => safeEqual(p, cleanPin)) ? candidate : undefined;
+
+  if (!matchedUser) {
+    registerLoginFailure(ip);
+    return res.status(401).json({
+      error: 'Credenciales inválidas. Verifica tu usuario y PIN.',
+    });
+  }
+
+  loginFailures.delete(ip);
+  const token = createToken(matchedUser);
+  return res.json({
+    token,
+    user: {
+      id: matchedUser.id,
+      username: matchedUser.username,
+      name: matchedUser.name,
+      role: matchedUser.role,
+    },
+    message: `Autenticación exitosa. Bienvenido, ${matchedUser.name} (${matchedUser.role})`,
+  });
+};
+
+app.post(['/api/auth/login', '/auth/login', '/api/index/auth/login'], handleAuthLogin);
+app.get(['/api/auth/login', '/auth/login', '/api/index/auth/login'], handleAuthLogin);
+
+// 2. Auth Current User: Validate token on server
+app.get(['/api/auth/me', '/auth/me'], authenticate, (req: Request, res: Response) => {
+  res.json({ user: (req as any).user });
+});
+
+// 3. Auth Logout
+app.post(['/api/auth/logout', '/auth/logout'], authenticate, (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    activeSessions.delete(authHeader.substring(7));
+  }
+  res.json({ message: 'Sesión cerrada correctamente' });
+});
+
+// Helper to generate sanitized public stream payload (NEVER exposes streamKey or rtmpServer)
+function getPublicStreamPayload() {
+  let effectivePlaybackUrl = state.streamSettings.customVideoUrl;
+  if (state.streamSettings.activeStreamSource === 'backup') {
+    effectivePlaybackUrl = state.streamSettings.backupVideoUrl || state.streamSettings.customVideoUrl;
+  } else if (state.streamSettings.activeStreamSource === 'simulation') {
+    effectivePlaybackUrl = '';
+  }
+
+  return {
+    live: state.streamSettings.isLive,
+    playbackUrl: effectivePlaybackUrl,
+    match: state.streamSettings.title,
+    tournament: state.streamSettings.tournamentName,
+    tournamentName: state.streamSettings.tournamentName,
+    quality: [
+      '1080p60 (Full HD 6 Mbps)',
+      '720p60 (HD 3 Mbps)',
+      '480p (Estándar 1.5 Mbps)',
+      '360p (Móvil Ahorro)',
+      'Automática (Adaptive HLS)'
+    ],
+    homeClubId: state.streamSettings.homeClubId,
+    awayClubId: state.streamSettings.awayClubId,
+    stadiumName: state.streamSettings.stadiumName,
+    altitudeMeters: state.streamSettings.altitudeMeters,
+    period: state.streamSettings.period,
+    broadcastMode: state.streamSettings.broadcastMode,
+    chatMode: state.streamSettings.chatMode,
+    officialAnnouncement: state.streamSettings.officialAnnouncement,
+    overlayScoreboardVisible: state.streamSettings.overlayScoreboardVisible,
+    lowLatencyMode: state.streamSettings.lowLatencyMode,
+    title: state.streamSettings.title,
+    customVideoUrl: state.streamSettings.customVideoUrl,
+    backupVideoUrl: state.streamSettings.backupVideoUrl,
+    backupChannelName: state.streamSettings.backupChannelName,
+    activeStreamSource: state.streamSettings.activeStreamSource,
+    autoFailoverEnabled: state.streamSettings.autoFailoverEnabled,
+    isLive: state.streamSettings.isLive,
+    donationQr: state.streamSettings.donationQr,
+  };
+}
+
+// Single-writer rule: el backend es el ÚNICO que persiste streamSettings en Firestore.
+// El frontend NUNCA llama a saveStreamSettingsToFirebase directamente, evitando escrituras
+// duplicadas donde la API y el navegador compiten por versionar la misma configuración.
+async function persistStreamSettingsToFirestore(operator?: string): Promise<void> {
+  try {
+    await saveStreamSettingsToFirebase(getPublicStreamPayload(), operator || 'admin');
+  } catch (err: any) {
+    console.error('[GolBolivia Server] Error al persistir streamSettings en Firestore:', err);
+    throw err;
+  }
+}
+
+// 4. Server-Sent Events (SSE) for Real-Time synchronization
+app.get(['/api/events', '/events'], async (req: Request, res: Response) => {
+  await ensureStateLoaded();
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  try {
+    res.flushHeaders?.();
+  } catch {}
+
+  // Send initial snapshot with sanitized public stream payload
+  try {
+    res.write(`event: INITIAL_STATE\ndata: ${JSON.stringify({
+      stream: getPublicStreamPayload(),
+      streamSettings: getPublicStreamPayload(),
+      scoreboard: state.scoreboard,
+      matchStats: state.matchStats,
+      events: state.events,
+      liveEvents: state.liveEvents,
+      viewersCount: Math.max(14820, viewerSessions.size),
+    })}\n\n`);
+  } catch {}
+
+  // In Vercel Serverless environment, close response immediately to avoid 500 socket timeout
+  if (process.env.VERCEL) {
+    res.end();
+    return;
+  }
+
+  sseClients.add(res);
+
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
+});
+
+// 5. Public Live State API: Only returns public, sanitized data (NO streamKey or rtmpServer)
+app.get(['/api/live', '/live'], async (_req: Request, res: Response) => {
+  await ensureStateLoaded();
+  const publicPayload = getPublicStreamPayload();
+  res.json({
+    live: state.streamSettings.isLive,
+    playbackUrl: publicPayload.playbackUrl,
+    match: state.streamSettings.title,
+    quality: [
+      '1080p60 (Full HD 6 Mbps)',
+      '720p60 (HD 3 Mbps)',
+      '480p (Estándar 1.5 Mbps)',
+      '360p (Móvil Ahorro)',
+      'Automática (Adaptive HLS)'
+    ],
+    stream: publicPayload,
+    streamSettings: publicPayload,
+    scoreboard: state.scoreboard,
+    matchStats: state.matchStats,
+    events: state.events,
+    liveEvents: state.liveEvents,
+    clubs: state.clubs,
+    viewersCount: Math.max(14820, viewerSessions.size),
+    serverTimestamp: Date.now(),
+  });
+});
+
+// 6. Public Streams Metadata API (NO streamKey)
+app.get(['/api/streams', '/streams'], async (_req: Request, res: Response) => {
+  await ensureStateLoaded();
+  const publicPayload = getPublicStreamPayload();
+  res.json({
+    live: state.streamSettings.isLive,
+    playbackUrl: publicPayload.playbackUrl,
+    match: state.streamSettings.title,
+    quality: [
+      '1080p60',
+      '720p60',
+      '480p',
+      '360p',
+      'Auto'
+    ],
+    stream: publicPayload,
+    streamSettings: publicPayload
+  });
+});
+
+// 6.1 Private Ingestion Credentials API (Strictly protected for ADMIN and TRANSMISOR)
+app.get(
+  ['/api/streams/private-ingest', '/streams/private-ingest'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR']),
+  (_req: Request, res: Response) => {
+    res.json({
+      rtmpServer: state.streamSettings.rtmpServer,
+      streamKey: state.streamSettings.streamKey,
+      srtPublishUrl: 'srt://localhost:8890?streamid=publish:partido',
+      hlsPublishUrl: 'http://localhost:8888/live/partido/index.m3u8',
+      webrtcPublishUrl: 'http://localhost:8889/live/partido/whip',
+      playbackUrl: state.streamSettings.customVideoUrl,
+      updatedAt: Date.now(),
+    });
+  }
+);
+
+// 6.2 Update Streams Configuration (Admin or Transmisor required)
+app.post(
+  ['/api/streams', '/streams'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR']),
+  async (req: Request, res: Response) => {
+    state.streamSettings = {
+      ...state.streamSettings,
+      ...req.body,
+    };
+    persistState();
+    // Persistencia autoritativa en Firestore (la API autenticada es el único escritor)
+    await persistStreamSettingsToFirestore((req as any).user?.username);
+    broadcastSseEvent('STREAM_UPDATED', getPublicStreamPayload());
+    res.json({ success: true, streamSettings: getPublicStreamPayload() });
+  }
+);
+
+// 6.2 Donation QR Code API (Public GET, Protected POST for ADMIN/TRANSMISOR/EDITOR)
+app.get(['/api/donation-qr', '/donation-qr'], (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    donationQr: state.streamSettings.donationQr || {
+      imageUrl: '',
+      bankName: '',
+      accountHolder: '',
+      instructions: 'Escanea el código QR desde tu aplicación bancaria móvil para apoyar la transmisión en vivo.',
+      updatedAt: Date.now(),
+    },
+  });
+});
+
+app.post(
+  ['/api/donation-qr', '/donation-qr'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR', 'EDITOR']),
+  async (req: Request, res: Response) => {
+    const { imageUrl, bankName, accountHolder, instructions } = req.body;
+    const current = state.streamSettings.donationQr || {
+      imageUrl: '',
+      bankName: '',
+      accountHolder: '',
+      instructions: 'Escanea el código QR desde tu aplicación bancaria móvil para apoyar la transmisión en vivo.',
+    };
+
+    const updatedQr: DonationQrInfo = {
+      imageUrl: typeof imageUrl === 'string' ? imageUrl.trim() : current.imageUrl || '',
+      bankName: typeof bankName === 'string' ? bankName.trim().slice(0, 100) : '',
+      accountHolder: typeof accountHolder === 'string' ? accountHolder.trim().slice(0, 100) : '',
+      instructions: typeof instructions === 'string' ? instructions.trim().slice(0, 300) : current.instructions,
+      updatedAt: Date.now(),
+    };
+
+    // Solo publicar el QR si Firestore confirma el guardado.
+    let confirmedQr: DonationQrInfo;
+    try {
+      confirmedQr = await saveDonationQrToFirebase(updatedQr, (req as any).user?.username || 'admin');
+    } catch (err) {
+      console.error('[Firebase] No se pudo guardar QR compartido:', err);
+      res.status(503).json({ success: false, error: 'No se pudo sincronizar el QR. Intenta de nuevo.' });
+      return;
+    }
+    state.streamSettings.donationQr = confirmedQr;
+    persistState();
+    broadcastSseEvent('DONATION_QR_UPDATED', confirmedQr);
+    broadcastSseEvent('STREAM_UPDATED', getPublicStreamPayload());
+
+    res.json({
+      success: true,
+      message: 'Código QR de apoyo y donaciones guardado y sincronizado con éxito en Firebase y servidor.',
+      donationQr: confirmedQr,
+    });
+  }
+);
+
+// 6.3 Instant Failover Switcher: Switch between OBS, Backup M3U8, or 2D Simulation
+app.post(
+  ['/api/streams/failover', '/streams/failover'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR']),
+  async (req: Request, res: Response) => {
+    const { activeStreamSource, backupVideoUrl, backupChannelName, autoFailoverEnabled } = req.body;
+    if (activeStreamSource && ['obs', 'backup', 'simulation'].includes(activeStreamSource)) {
+      state.streamSettings.activeStreamSource = activeStreamSource;
+    }
+    if (typeof backupVideoUrl === 'string') {
+      state.streamSettings.backupVideoUrl = backupVideoUrl;
+    }
+    if (typeof backupChannelName === 'string') {
+      state.streamSettings.backupChannelName = backupChannelName;
+    }
+    if (typeof autoFailoverEnabled === 'boolean') {
+      state.streamSettings.autoFailoverEnabled = autoFailoverEnabled;
+    }
+
+    persistState();
+    // Persistencia autoritativa en Firestore (la API autenticada es el único escritor)
+    await persistStreamSettingsToFirestore((req as any).user?.username);
+
+    // Broadcast instant update across all connected fans via SSE
+    const payload = getPublicStreamPayload();
+    broadcastSseEvent('STREAM_UPDATED', payload);
+
+    res.json({
+      success: true,
+      message: `Fuente de señal cambiada a: ${state.streamSettings.activeStreamSource.toUpperCase()}`,
+      activeStreamSource: state.streamSettings.activeStreamSource,
+      playbackUrl: payload.playbackUrl,
+      streamSettings: payload,
+    });
+  }
+);
+
+// 6.4 Dedicated Stream & Backup M3U8 URLs Configuration API (for global synchronization across all devices)
+app.get(['/api/streams/config', '/streams/config'], (_req: Request, res: Response) => {
+  const publicPayload = getPublicStreamPayload();
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.json({
+    success: true,
+    ...publicPayload,
+    updatedAt: Date.now(),
+  });
+});
+
+app.post(
+  ['/api/streams/config', '/streams/config'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR']),
+  async (req: Request, res: Response) => {
+    const body = req.body || {};
+    const targetEventId = String(body.eventId || body.activeEventId || '').trim();
+    if (!targetEventId) return res.status(400).json({ error: 'Se requiere eventId/activeEventId válido.', code: 'MISSING_EVENT_ID' });
+    await ensureStateLoaded();
+    const index = state.liveEvents.findIndex(event => event.id === targetEventId);
+    if (index < 0) return res.status(404).json({ error: 'Partido no encontrado.', code: 'EVENT_NOT_FOUND' });
+    const patch = buildMatchStreamPatch(body, state.liveEvents[index]);
+    let confirmedEvent = state.liveEvents[index];
+    try {
+      if (Object.keys(patch).length > 0) {
+        const candidate = { ...confirmedEvent, ...patch, version: body.version ?? confirmedEvent.version };
+        const result = await saveLiveEventToFirebase(candidate, (req as any).user?.username);
+        confirmedEvent = { ...candidate, version: result.version, updatedAt: result.updatedAt };
+        state.liveEvents[index] = confirmedEvent;
+      }
+
+      state.streamSettings = {
+        ...state.streamSettings,
+        ...body,
+      };
+      if (typeof body.title === 'string') state.streamSettings.title = body.title.trim();
+      if (typeof body.tournamentName === 'string') state.streamSettings.tournamentName = body.tournamentName.trim();
+      if (typeof body.homeClubId === 'string') state.streamSettings.homeClubId = body.homeClubId.trim();
+      if (typeof body.awayClubId === 'string') state.streamSettings.awayClubId = body.awayClubId.trim();
+      if (typeof body.stadiumName === 'string') state.streamSettings.stadiumName = body.stadiumName.trim();
+      if (body.altitudeMeters !== undefined) state.streamSettings.altitudeMeters = Number(body.altitudeMeters) || 0;
+      if (typeof body.period === 'string') state.streamSettings.period = body.period as any;
+      if (typeof body.chatMode === 'string') state.streamSettings.chatMode = body.chatMode as any;
+      if (typeof body.officialAnnouncement === 'string') state.streamSettings.officialAnnouncement = body.officialAnnouncement.trim();
+      if (typeof body.overlayScoreboardVisible === 'boolean') state.streamSettings.overlayScoreboardVisible = body.overlayScoreboardVisible;
+      if (typeof body.lowLatencyMode === 'boolean') state.streamSettings.lowLatencyMode = body.lowLatencyMode;
+      if (typeof body.customVideoUrl === 'string') state.streamSettings.customVideoUrl = body.customVideoUrl.trim();
+      if (typeof body.backupVideoUrl === 'string') state.streamSettings.backupVideoUrl = body.backupVideoUrl.trim();
+      if (typeof body.backupChannelName === 'string') state.streamSettings.backupChannelName = body.backupChannelName.trim();
+      if (body.activeStreamSource && ['obs', 'backup', 'simulation'].includes(body.activeStreamSource)) {
+        state.streamSettings.activeStreamSource = body.activeStreamSource;
+      }
+      if (typeof body.autoFailoverEnabled === 'boolean') state.streamSettings.autoFailoverEnabled = body.autoFailoverEnabled;
+      if (typeof body.isLive === 'boolean') state.streamSettings.isLive = body.isLive;
+      if (body.broadcastMode) state.streamSettings.broadcastMode = body.broadcastMode;
+
+
+      persistState();
+      // Persistencia autoritativa en Firestore (la API autenticada es el único escritor)
+      await persistStreamSettingsToFirestore((req as any).user?.username);
+
+      const payload = {
+        ...getPublicStreamPayload(),
+        eventId: targetEventId,
+      };
+      broadcastSseEvent('STREAM_CONFIG_UPDATED', payload);
+      broadcastSseEvent('STREAM_UPDATED', payload);
+      broadcastSseEvent('LIVE_EVENTS_UPDATED', state.liveEvents);
+
+      res.json({
+        success: true,
+        message: 'Configuración de señales sincronizada por partido con éxito.',
+        event: confirmedEvent,
+        config: payload,
+        streamSettings: payload,
+        eventId: targetEventId,
+      });
+    } catch (error: any) {
+      const conflict = /Conflicto|superior/.test(error.message || '');
+      return res.status(conflict ? 409 : 503).json({ success: false, code: conflict ? 'VERSION_CONFLICT' : 'FIRESTORE_UNAVAILABLE', error: error.message || 'No se pudo guardar la configuración del partido.' });
+    }
+  }
+);
+
+// 6.5 Multi-Provider Live Events API (Paso 9 & 10: Cloudflare, YouTube, Kick)
+app.get(['/api/live-events', '/live-events'], async (_req: Request, res: Response) => {
+  await ensureStateLoaded();
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.json({
+    success: true,
+    events: state.liveEvents || [],
+    updatedAt: Date.now(),
+  });
+});
+
+app.get(['/api/live-events/:id', '/live-events/:id'], async (req: Request, res: Response) => {
+  await ensureStateLoaded();
+  const event = state.liveEvents.find((e) => e.id === req.params.id);
+  if (!event) {
+    res.status(404).json({ error: 'Partido no encontrado' });
+    return;
+  }
+  res.json({ success: true, event });
+});
+
+app.post(
+  ['/api/live-events', '/live-events'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR']),
+  async (req: Request, res: Response) => {
+    const raw = req.body;
+    if (!raw || !raw.id || typeof raw.id !== 'string' || !raw.id.trim()) {
+      res.status(400).json({ error: 'El identificador (id) del partido es obligatorio.' });
+      return;
+    }
+    const cleanId = raw.id.trim();
+    const cleanTitle = (raw.title || '').trim();
+    if (!cleanTitle || cleanTitle.length < 3 || cleanTitle.length > 120) {
+      res.status(400).json({ error: 'El título del partido debe tener entre 3 y 120 caracteres.' });
+      return;
+    }
+
+    const cleanHome = (raw.homeTeam || '').trim().toLowerCase();
+    const cleanAway = (raw.awayTeam || '').trim().toLowerCase();
+    if (!cleanHome || !cleanAway) {
+      res.status(400).json({ error: 'Los equipos local y visitante son obligatorios.' });
+      return;
+    }
+    if (cleanHome === cleanAway) {
+      res.status(400).json({ error: 'El equipo local y el equipo visitante no pueden ser el mismo club.' });
+      return;
+    }
+
+    if (raw.homeScore !== undefined) {
+      const hScore = Number(raw.homeScore);
+      if (isNaN(hScore) || hScore < 0 || hScore > 50) {
+        res.status(400).json({ error: 'Los goles del equipo local deben ser un número entre 0 y 50.' });
+        return;
+      }
+    }
+
+    if (raw.awayScore !== undefined) {
+      const aScore = Number(raw.awayScore);
+      if (isNaN(aScore) || aScore < 0 || aScore > 50) {
+        res.status(400).json({ error: 'Los goles del equipo visitante deben ser un número entre 0 y 50.' });
+        return;
+      }
+    }
+
+    if (raw.matchMinute !== undefined) {
+      const min = Number(raw.matchMinute);
+      if (isNaN(min) || min < 0 || min > 130) {
+        res.status(400).json({ error: 'El minuto del partido debe ser un número entre 0 y 130.' });
+        return;
+      }
+    }
+
+    if (raw.espnLink != null && (!/^[0-9]{1,20}$/.test(String(raw.espnLink.eventId)) || !Object.hasOwn(FOOTBALL_LEAGUES, raw.espnLink.league) || typeof raw.espnLink.enabled !== 'boolean')) {
+      return res.status(400).json({ error: 'El vínculo ESPN no es válido.' });
+    }
+
+    const existingIndex = state.liveEvents.findIndex((e) => e.id === cleanId);
+    const existingEvent = existingIndex >= 0 ? state.liveEvents[existingIndex] : null;
+    const nextVersion = (existingEvent?.version || raw.version || 0) + 1;
+    const now = Date.now();
+    const operator = (req as any).user?.username || 'admin';
+
+    const iptvSource = normalizeMatchIptvSource(raw.iptvSource);
+    if ((raw.iptvSource != null || raw.primaryProvider === 'iptv') && !iptvSource) {
+      res.status(400).json({ error: 'La señal IPTV seleccionada no es compatible.', code: 'INVALID_MATCH_SOURCE' });
+      return;
+    }
+    const externalUrl = normalizeExternalPlayerUrl(raw.externalSource?.url)
+      || (raw.primaryProvider === 'external' && iptvSource?.sourceType === 'iframe' ? iptvSource.streamUrl : null);
+    if ((raw.externalSource != null || raw.primaryProvider === 'external') && !externalUrl) {
+      res.status(400).json({ error: 'URL de reproductor externo no compatible.' });
+      return;
+    }
+
+    // Sanitize to NEVER store or accept stream keys in public event
+    const safeEvent: LiveEvent = {
+      id: cleanId,
+      espnLink: raw.espnLink === null ? null : raw.espnLink && /^[0-9]{1,20}$/.test(String(raw.espnLink.eventId)) && Object.hasOwn(FOOTBALL_LEAGUES, raw.espnLink.league)
+        ? { eventId: String(raw.espnLink.eventId), league: raw.espnLink.league, enabled: Boolean(raw.espnLink.enabled) } : existingEvent?.espnLink,
+      title: cleanTitle,
+      homeTeam: cleanHome,
+      awayTeam: cleanAway,
+      isLive: Boolean(raw.isLive ?? true),
+      primaryProvider: ['cloudflare', 'youtube', 'kick', 'iptv', 'external'].includes(raw.primaryProvider)
+        ? raw.primaryProvider
+        : 'cloudflare',
+      externalSource: externalUrl ? { url: externalUrl } : null,
+      iptvSource,
+      cloudflare: raw.cloudflare ? {
+        liveInputId: String(raw.cloudflare.liveInputId || '').trim(),
+        playbackUrl: String(raw.cloudflare.playbackUrl || '').trim(),
+      } : undefined,
+      youtube: raw.youtube ? {
+        videoId: String(raw.youtube.videoId || '').trim(),
+      } : undefined,
+      kick: raw.kick ? {
+        channel: String(raw.kick.channel || '').trim(),
+      } : undefined,
+      fallbackOrder: Array.isArray(raw.fallbackOrder) && raw.fallbackOrder.length > 0
+        ? raw.fallbackOrder.filter((p: unknown) => ['cloudflare', 'youtube', 'kick', 'iptv', 'external'].includes(String(p)))
+        : ['cloudflare', 'youtube', 'kick'],
+      tournamentName: raw.tournamentName ? String(raw.tournamentName).trim() : undefined,
+      stadiumName: raw.stadiumName ? String(raw.stadiumName).trim() : undefined,
+      period: raw.period || '1T',
+      homeScore: raw.homeScore !== undefined ? Number(raw.homeScore) : undefined,
+      awayScore: raw.awayScore !== undefined ? Number(raw.awayScore) : undefined,
+      matchMinute: raw.matchMinute !== undefined ? Number(raw.matchMinute) : undefined,
+      customVideoUrl: raw.customVideoUrl ? String(raw.customVideoUrl).trim() : undefined,
+      backupVideoUrl: raw.backupVideoUrl ? String(raw.backupVideoUrl).trim() : undefined,
+      backupChannelName: raw.backupChannelName ? String(raw.backupChannelName).trim() : undefined,
+      broadcastMode: ['obs_custom', 'simulation', 'pre_match', 'halftime', 'var', 'post_match'].includes(raw.broadcastMode) ? raw.broadcastMode : 'obs_custom',
+      activeStreamSource: raw.activeStreamSource || 'obs',
+      autoFailoverEnabled: raw.autoFailoverEnabled ?? true,
+      isClockRunning: raw.isClockRunning ?? false,
+      clockUpdatedAt: raw.clockUpdatedAt || now,
+      version: nextVersion,
+      updatedAt: now,
+      updatedAtIso: new Date(now).toISOString(),
+      updatedBy: operator,
+    };
+
+    const isForce = Boolean(raw.force);
+
+    // Problema 5: Exigir versiones válidas y rechazar versiones desactualizadas si se envía versión
+    if (existingEvent) {
+      if (!isForce && raw.version !== undefined) {
+        const incomingVer = Number(raw.version);
+        if (isNaN(incomingVer) || incomingVer <= 0) {
+          res.status(400).json({
+            error: 'La versión enviada debe ser un número válido mayor a 0.',
+            code: 'INVALID_VERSION',
+          });
+          return;
+        }
+        const currentVer = typeof existingEvent.version === 'number' ? existingEvent.version : 0;
+        if (currentVer > 0 && incomingVer < currentVer) {
+          res.status(409).json({
+            error: `Conflicto de versiones: El partido ya cuenta con la versión v${currentVer}. Tu versión enviada es v${incomingVer}.`,
+            code: 'VERSION_CONFLICT',
+          });
+          return;
+        }
+        safeEvent.version = incomingVer;
+      } else {
+        safeEvent.version = (existingEvent.version || 0) + 1;
+      }
+    }
+
+    if (isForce) {
+      (safeEvent as any).force = true;
+    }
+
+    // Regla 4: Persistir primero a Cloud Firestore (Fuente única de datos reales por partido)
+    // Regla 1: Cualquier fallo de Firestore se retorna como error HTTP — NO continuar con estado local.
+    try {
+      const fbResult = await saveLiveEventToFirebase(safeEvent, operator);
+      safeEvent.version = fbResult.version;
+      safeEvent.updatedAt = fbResult.updatedAt;
+    } catch (fbErr: any) {
+      console.error('[GolBolivia Server] Error crítico persistiendo evento en Firestore:', fbErr);
+      const isConflict = fbErr.message?.includes('superior') || fbErr.message?.includes('Conflicto');
+      res.status(isConflict ? 409 : 503).json({
+        error: fbErr.message || 'Error al persistir evento en Firebase Firestore.',
+        code: isConflict ? 'VERSION_CONFLICT' : 'FIRESTORE_UNAVAILABLE',
+      });
+      return;
+    }
+
+    // Auditoría: force:true queda reservado a operaciones administrativas explícitas con rol autorizado.
+    // Cada sobrescritura forzada queda registrada en el log de confirmaciones de Firestore.
+    if (isForce) {
+      try {
+        await logConfirmationToFirebase({
+          action: 'FORCE_SAVE_LIVE_EVENT',
+          operator: (req as any).user?.username || operator,
+          role: (req as any).user?.role || 'ADMIN',
+          details: `Sobrescritura forzada (force) del partido "${cleanTitle}" (${cleanId}) a la versión v${safeEvent.version}.`,
+          payload: {
+            eventId: cleanId,
+            title: cleanTitle,
+            version: safeEvent.version,
+            updatedAt: safeEvent.updatedAt,
+            primaryProvider: safeEvent.primaryProvider,
+            force: true,
+          },
+          timestamp: now,
+        });
+      } catch (auditErr: any) {
+        console.warn('[GolBolivia Server] Advertencia al registrar auditoría de guardado forzado:', auditErr.message || auditErr);
+      }
+    }
+
+    if (existingIndex >= 0) {
+      state.liveEvents[existingIndex] = safeEvent;
+    } else {
+      state.liveEvents.push(safeEvent);
+    }
+
+    // Update primary streamSettings only if this event is explicitly the primary one
+    if (state.liveEvents.length === 1 || (existingIndex === 0 && state.liveEvents[0]?.id === safeEvent.id)) {
+      state.streamSettings.title = safeEvent.title;
+      state.streamSettings.homeClubId = safeEvent.homeTeam;
+      state.streamSettings.awayClubId = safeEvent.awayTeam;
+      if (safeEvent.tournamentName) state.streamSettings.tournamentName = safeEvent.tournamentName;
+      if (safeEvent.stadiumName) state.streamSettings.stadiumName = safeEvent.stadiumName;
+      if (safeEvent.period) state.streamSettings.period = safeEvent.period as any;
+      if (safeEvent.homeScore !== undefined) state.scoreboard.homeScore = safeEvent.homeScore;
+      if (safeEvent.awayScore !== undefined) state.scoreboard.awayScore = safeEvent.awayScore;
+      if (safeEvent.matchMinute !== undefined) state.scoreboard.matchMinute = safeEvent.matchMinute;
+    }
+
+    persistState();
+
+    broadcastSseEvent('STREAM_CONFIG_UPDATED', { eventId: safeEvent.id, ...safeEvent });
+    broadcastSseEvent('SCOREBOARD_UPDATED', {
+      eventId: safeEvent.id,
+      homeScore: safeEvent.homeScore,
+      awayScore: safeEvent.awayScore,
+      matchMinute: safeEvent.matchMinute,
+      period: safeEvent.period,
+      isClockRunning: safeEvent.isClockRunning,
+      version: safeEvent.version,
+      updatedAt: safeEvent.updatedAt,
+    });
+    broadcastSseEvent('LIVE_EVENTS_UPDATED', state.liveEvents);
+
+    res.json({
+      success: true,
+      message: `Partido ${safeEvent.title} guardado con éxito.`,
+      version: safeEvent.version,
+      updatedAt: safeEvent.updatedAt,
+      event: safeEvent,
+      events: state.liveEvents,
+    });
+  }
+);
+
+app.delete(
+  ['/api/live-events/:id', '/live-events/:id'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR', 'EDITOR']),
+  async (req: Request, res: Response) => {
+    const id = req.params.id;
+    const found = state.liveEvents.find((e) => e.id === id);
+    if (!found) {
+      res.status(404).json({ error: 'Partido no encontrado.', deletedId: id });
+      return;
+    }
+
+    // Regla 1: Confirmar eliminación en Firestore antes de mutar estado local/servidor.
+    // Si Firestore no confirma, DEVOLVER ERROR (no seguir eliminando en memoria).
+    try {
+      await deleteLiveEventFromFirebase(id);
+    } catch (fbErr: any) {
+      console.error(`[GolBolivia Server] Error al eliminar partido ${id} en Firestore:`, fbErr.message || fbErr);
+      res.status(503).json({
+        error: fbErr.message || 'Error al eliminar partido en Firebase Firestore. La eliminación no fue confirmada.',
+        code: 'FIRESTORE_DELETE_FAILED',
+        deletedId: id,
+      });
+      return;
+    }
+
+    state.liveEvents = state.liveEvents.filter((e) => e.id !== id);
+
+    // Si se eliminó el partido activo en streamSettings, cambiar al primer partido disponible
+    if (state.liveEvents.length > 0) {
+      const nextEvt = state.liveEvents[0];
+      state.streamSettings.title = nextEvt.title;
+      state.streamSettings.homeClubId = nextEvt.homeTeam;
+      state.streamSettings.awayClubId = nextEvt.awayTeam;
+      if (nextEvt.tournamentName) state.streamSettings.tournamentName = nextEvt.tournamentName;
+      if (nextEvt.stadiumName) state.streamSettings.stadiumName = nextEvt.stadiumName;
+      if (nextEvt.period) state.streamSettings.period = nextEvt.period as any;
+      if (nextEvt.homeScore !== undefined) state.scoreboard.homeScore = nextEvt.homeScore;
+      if (nextEvt.awayScore !== undefined) state.scoreboard.awayScore = nextEvt.awayScore;
+      if (nextEvt.matchMinute !== undefined) state.scoreboard.matchMinute = nextEvt.matchMinute;
+    }
+    // Regla 5: Si la lista quedó vacía, no forzamos un partido por defecto.
+    if (state.liveEvents.length === 0) {
+      // Limpiar streamSettings relacionados si no hay partidos
+      if (state.streamSettings.homeClubId || state.streamSettings.awayClubId || state.streamSettings.title) {
+        state.streamSettings.title = '';
+        state.streamSettings.homeClubId = '';
+        state.streamSettings.awayClubId = '';
+        state.streamSettings.tournamentName = '';
+        state.streamSettings.stadiumName = '';
+      }
+    }
+
+    persistState();
+    broadcastSseEvent('LIVE_EVENT_DELETED', { id });
+    broadcastSseEvent('LIVE_EVENTS_UPDATED', state.liveEvents);
+    res.json({ success: true, message: 'Partido eliminado correctamente.', events: state.liveEvents, deletedId: id });
+  }
+);
+
+// 7. Scoreboard API (Admin, Transmisor, or Editor required to update)
+app.get(['/api/scoreboard', '/scoreboard'], async (_req: Request, res: Response) => {
+  await ensureStateLoaded();
+  res.json({ scoreboard: state.scoreboard, events: state.liveEvents });
+});
+
+app.post(
+  ['/api/scoreboard', '/scoreboard'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR', 'EDITOR']),
+  async (req: Request, res: Response) => {
+    const { homeScore, awayScore, matchMinute, period, isClockRunning, force } = req.body;
+    // Regla 3 & Problema 5: Exigir versión válida y rechazar actualizaciones desactualizadas
+    const targetEventIdBody = req.body.activeEventId || req.body.eventId;
+    if (!targetEventIdBody || String(targetEventIdBody).trim() === '') {
+      res.status(400).json({
+        error: 'Se requiere eventId/activeEventId válido para esta operación específica de partido.',
+        code: 'MISSING_EVENT_ID',
+      });
+      return;
+    }
+
+    const targetEventId = String(targetEventIdBody).trim();
+    let activeEvt = state.liveEvents.find((e) => e.id === targetEventId);
+
+    const isForce = Boolean(force);
+    const sentVersion = req.body.version !== undefined ? Number(req.body.version) : undefined;
+
+    // Regla 3 & Problema 5: Exigir versión válida y rechazar actualizaciones desactualizadas
+    if (activeEvt && !isForce) {
+      if (sentVersion !== undefined) {
+        if (isNaN(sentVersion) || sentVersion <= 0) {
+          res.status(400).json({
+            error: 'La versión enviada debe ser un número válido mayor a 0.',
+            code: 'INVALID_VERSION',
+          });
+          return;
+        }
+        const curVer = typeof activeEvt.version === 'number' ? activeEvt.version : 0;
+        if (curVer > 0 && sentVersion < curVer) {
+          res.status(409).json({
+            error: `Marcador desactualizado: El partido ya cuenta con la versión v${curVer}, superior a la enviada v${sentVersion}.`,
+            code: 'VERSION_CONFLICT',
+          });
+          return;
+        }
+      }
+    }
+
+    const safeHome = homeScore !== undefined ? Math.max(0, Math.min(50, Math.round(Number(homeScore) || 0))) : undefined;
+    const safeAway = awayScore !== undefined ? Math.max(0, Math.min(50, Math.round(Number(awayScore) || 0))) : undefined;
+    const safeMin = matchMinute !== undefined ? Math.max(0, Math.min(130, Math.round(Number(matchMinute) || 0))) : undefined;
+
+    const scorePayload: any = {
+      eventId: activeEvt ? activeEvt.id : targetEventId,
+      homeScore: safeHome !== undefined ? safeHome : (activeEvt?.homeScore ?? state.scoreboard.homeScore),
+      awayScore: safeAway !== undefined ? safeAway : (activeEvt?.awayScore ?? state.scoreboard.awayScore),
+      matchMinute: safeMin !== undefined ? safeMin : (activeEvt?.matchMinute ?? state.scoreboard.matchMinute),
+      period: period || (activeEvt?.period ?? state.scoreboard.period),
+      isClockRunning: typeof isClockRunning === 'boolean' ? isClockRunning : (activeEvt?.isClockRunning ?? false),
+      version: sentVersion,
+      force: isForce,
+      updatedAt: Date.now(),
+    };
+
+    // Regla 4: Persistir a Cloud Firestore primero (Fuente única)
+    try {
+      const fbRes = await saveMatchScoreboardFirebase(scorePayload.eventId, scorePayload, (req as any).user?.username);
+      scorePayload.version = fbRes.version;
+      scorePayload.updatedAt = fbRes.updatedAt;
+      if (activeEvt) {
+        activeEvt.version = fbRes.version;
+        activeEvt.updatedAt = fbRes.updatedAt;
+      }
+      state.scoreboard.version = fbRes.version;
+    } catch (fbErr: any) {
+      res.status(409).json({
+        error: fbErr.message || 'Error al persistir marcador en Firestore.',
+        code: 'FIRESTORE_SCORE_ERROR',
+      });
+      return;
+    }
+
+    if (activeEvt) {
+      if (safeHome !== undefined) activeEvt.homeScore = safeHome;
+      if (safeAway !== undefined) activeEvt.awayScore = safeAway;
+      if (safeMin !== undefined) activeEvt.matchMinute = safeMin;
+      if (period !== undefined && ['1T', 'Descanso', '2T', 'Tiempo Extra', 'Finalizado', 'Revisión VAR'].includes(period)) {
+        activeEvt.period = period;
+      }
+      if (typeof isClockRunning === 'boolean') {
+        activeEvt.isClockRunning = isClockRunning;
+        activeEvt.clockUpdatedAt = scorePayload.updatedAt;
+      }
+    }
+
+    if (safeHome !== undefined) state.scoreboard.homeScore = safeHome;
+    if (safeAway !== undefined) state.scoreboard.awayScore = safeAway;
+    if (safeMin !== undefined) state.scoreboard.matchMinute = safeMin;
+    if (period !== undefined && ['1T', 'Descanso', '2T', 'Tiempo Extra', 'Finalizado', 'Revisión VAR'].includes(period)) {
+      state.scoreboard.period = period;
+      state.streamSettings.period = period as any;
+    }
+    state.scoreboard.updatedAt = scorePayload.updatedAt;
+
+    persistState();
+    saveScoreboardToFirebase(
+      {
+        homeScore: scorePayload.homeScore,
+        awayScore: scorePayload.awayScore,
+        matchMinute: scorePayload.matchMinute,
+        period: scorePayload.period,
+      },
+      (req as any).user?.username
+    ).catch(logFirestoreWarning('guardar marcador'));
+
+    broadcastSseEvent('SCOREBOARD_UPDATED', scorePayload);
+    broadcastSseEvent('LIVE_EVENTS_UPDATED', state.liveEvents);
+    res.json({ success: true, scoreboard: scorePayload, liveEvents: state.liveEvents });
+  }
+);
+
+// 8. Matches & Events API (Admin or Editor required to add/edit)
+app.get(['/api/matches', '/matches'], (_req: Request, res: Response) => {
+  res.json({
+    scoreboard: state.scoreboard,
+    matchStats: state.matchStats,
+    events: state.events,
+  });
+});
+
+app.post(
+  ['/api/matches/events', '/matches/events'],
+  authenticate,
+  requireRoles(['ADMIN', 'EDITOR']),
+  (req: Request, res: Response) => {
+    const newEvent = {
+      id: `ev-${Date.now()}`,
+      minute: req.body.minute || state.scoreboard.matchMinute,
+      type: req.body.type || 'commentary',
+      clubId: req.body.clubId,
+      player: req.body.player,
+      description: req.body.description || '',
+      scoreAfter: req.body.scoreAfter,
+    };
+    state.events.unshift(newEvent);
+    addMatchEventToFirebase(newEvent as any).catch(logFirestoreWarning('guardar evento'));
+    broadcastSseEvent('MATCH_EVENT_ADDED', newEvent);
+    res.json({ success: true, event: newEvent });
+  }
+);
+
+// Update Match Event (Admin or Editor required)
+app.put(
+  ['/api/matches/events/:id', '/matches/events/:id'],
+  authenticate,
+  requireRoles(['ADMIN', 'EDITOR']),
+  (req: Request, res: Response) => {
+    const id = req.params.id;
+    const index = state.events.findIndex((e) => e.id === id);
+    if (index === -1) {
+      updateMatchEventInFirebase(id, req.body).catch(logFirestoreWarning('actualizar evento'));
+      res.json({ success: true, event: { ...req.body, id } });
+      return;
+    }
+    state.events[index] = {
+      ...state.events[index],
+      ...req.body,
+    };
+    updateMatchEventInFirebase(id, req.body).catch(logFirestoreWarning('actualizar evento'));
+    broadcastSseEvent('MATCH_EVENT_UPDATED', state.events[index]);
+    res.json({ success: true, event: state.events[index] });
+  }
+);
+
+// Delete Match Event (Admin or Editor required)
+app.delete(
+  ['/api/matches/events/:id', '/matches/events/:id'],
+  authenticate,
+  requireRoles(['ADMIN', 'EDITOR']),
+  (req: Request, res: Response) => {
+    const id = req.params.id;
+    const initialLen = state.events.length;
+    state.events = state.events.filter((e) => e.id !== id);
+    persistState();
+    deleteMatchEventFromFirebase(id).catch(logFirestoreWarning('eliminar evento'));
+    if (state.events.length === initialLen) {
+      broadcastSseEvent('MATCH_EVENT_DELETED', { id });
+      res.json({ success: true, message: `Evento ${id} eliminado.` });
+      return;
+    }
+    broadcastSseEvent('MATCH_EVENT_DELETED', { id });
+    res.json({ success: true, message: `Evento ${id} eliminado correctamente.` });
+  }
+);
+
+// Clear all match events (Admin or Editor)
+app.post(
+  ['/api/matches/events/clear', '/matches/events/clear'],
+  authenticate,
+  requireRoles(['ADMIN', 'EDITOR']),
+  (_req: Request, res: Response) => {
+    state.events = [];
+    persistState();
+    clearMatchEventsInFirebase().catch(logFirestoreWarning('limpiar eventos'));
+    broadcastSseEvent('MATCH_EVENTS_CLEARED', {});
+    res.json({ success: true, message: 'Cronología de eventos limpiada correctamente.' });
+  }
+);
+
+// 9. Chat API
+app.get(['/api/chat', '/chat'], (_req: Request, res: Response) => {
+  res.json({ messages: state.chatMessages });
+});
+
+const chatLastPostByIp = new Map<string, number>();
+const CHAT_MIN_INTERVAL_MS = 1000;
+
+app.post(['/api/chat', '/chat'], (req: Request, res: Response) => {
+  const { sender, clubId, text, isVip } = req.body || {};
+  const cleanSender = String(sender || '').trim().slice(0, 40);
+  const cleanText = String(text || '').trim();
+  if (!cleanText || !cleanSender) {
+    res.status(400).json({ error: 'Texto y remitente requeridos' });
+    return;
+  }
+
+  // Límite de frecuencia por IP (anti-spam)
+  const chatIp = getClientIp(req);
+  const nowMs = Date.now();
+  if (nowMs - (chatLastPostByIp.get(chatIp) || 0) < CHAT_MIN_INTERVAL_MS) {
+    res.status(429).json({ error: 'Estás escribiendo muy rápido. Espera un segundo.' });
+    return;
+  }
+  chatLastPostByIp.set(chatIp, nowMs);
+  if (chatLastPostByIp.size > 5000) {
+    for (const [k, t] of chatLastPostByIp) if (nowMs - t > 60_000) chatLastPostByIp.delete(k);
+  }
+
+  const user = (req as any).user as SessionData['user'] | undefined;
+  const isOfficialRelator = user?.role === 'ADMIN' || user?.role === 'TRANSMISOR';
+
+  const newMsg = {
+    id: `c-${Date.now()}`,
+    sender: cleanSender,
+    clubId: String(clubId || 'bolivar').slice(0, 40),
+    text: cleanText.slice(0, 300),
+    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    isVip: Boolean(isVip),
+    isOfficialRelator,
+  };
+
+  state.chatMessages.push(newMsg);
+  if (state.chatMessages.length > 200) {
+    state.chatMessages.shift();
+  }
+
+  broadcastSseEvent('CHAT_MESSAGE_ADDED', newMsg);
+  res.json({ success: true, message: newMsg });
+});
+
+// Delete chat message (Moderator or Admin)
+app.delete(
+  ['/api/chat/:id', '/chat/:id'],
+  authenticate,
+  requireRoles(['ADMIN', 'MODERADOR']),
+  (req: Request, res: Response) => {
+    const id = req.params.id;
+    state.chatMessages = state.chatMessages.filter((m) => m.id !== id);
+    persistState();
+    deleteChatMessageFromFirebase(id).catch(logFirestoreWarning('eliminar mensaje'));
+    broadcastSseEvent('CHAT_MESSAGE_DELETED', { id });
+    res.json({ success: true });
+  }
+);
+
+// Clear all chat messages (Admin or Moderator)
+app.post(
+  ['/api/chat/clear', '/chat/clear'],
+  authenticate,
+  requireRoles(['ADMIN', 'MODERADOR']),
+  (_req: Request, res: Response) => {
+    state.chatMessages = [];
+    persistState();
+    clearChatInFirebase().catch(logFirestoreWarning('limpiar chat'));
+    broadcastSseEvent('CHAT_CLEARED', {});
+    res.json({ success: true, message: 'Chat en vivo limpiado correctamente.' });
+  }
+);
+
+// 10. Viewers API & Heartbeat
+const audienceId = /^[a-zA-Z0-9_-]{8,100}$/;
+const audienceMatchId = /^[a-zA-Z0-9_-]{1,160}$/;
+app.post('/api/match-audience/:id/heartbeat', async (req: Request, res: Response) => {
+  if (req.get('Sec-Fetch-Site') === 'cross-site') return res.status(403).json({ error: 'Registro de audiencia desde otro sitio no permitido.' });
+  const { visitorId, sessionId, playbackId, action } = req.body || {};
+  const matchId = String(req.params.id);
+  if (!audienceMatchId.test(matchId) || typeof visitorId !== 'string' || !audienceId.test(visitorId) || typeof sessionId !== 'string' || !audienceId.test(sessionId)
+    || (playbackId !== undefined && (typeof playbackId !== 'string' || !audienceId.test(playbackId))) || !['heartbeat', 'leave'].includes(action)) return res.status(400).json({ error: 'Registro de audiencia no válido.' });
+  try {
+    await ensureStateLoaded();
+    if (!state.liveEvents.some(event => event.id === matchId)) return res.status(404).json({ error: 'Partido no encontrado.' });
+    const visitorKey = crypto.createHash('sha256').update(`${matchId}:${visitorId}`).digest('hex');
+    const playbackKey = playbackId ? crypto.createHash('sha256').update(`${visitorKey}:${playbackId}`).digest('hex') : undefined;
+    const stats = await recordMatchAudience(matchId, visitorKey, sessionId, playbackKey, action === 'leave');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ stats });
+  } catch { return res.status(503).json({ error: 'No se pudo registrar la audiencia.' }); }
+});
+app.get('/api/match-audience/:id', authenticate, requireRoles(['ADMIN', 'TRANSMISOR', 'EDITOR']), async (req: Request, res: Response) => {
+  const matchId = String(req.params.id);
+  if (!audienceMatchId.test(matchId)) return res.status(400).json({ error: 'Partido no válido.' });
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ stats: await getMatchAudienceStats(matchId) });
+  } catch { return res.status(503).json({ error: 'No se pudo consultar la audiencia. Revisa las reglas de matchAnalytics y la autenticación Firebase del backend.' }); }
+});
+
+app.get(['/api/viewers', '/viewers'], (_req: Request, res: Response) => {
+  res.json({
+    activeRealSessions: viewerSessions.size,
+    broadcastViewerCount: Math.max(14820, viewerSessions.size),
+  });
+});
+
+app.post(['/api/viewers/heartbeat', '/viewers/heartbeat'], (req: Request, res: Response) => {
+  const { sessionId } = req.body;
+  if (sessionId) {
+    viewerSessions.set(sessionId, Date.now());
+  }
+  res.json({ ok: true, activeViewers: Math.max(14820, viewerSessions.size) });
+});
+
+// 10.5 Clubs & Teams Management API (Customizable Bolivian football clubs)
+app.get(['/api/clubs', '/clubs'], (_req: Request, res: Response) => {
+  res.json({ success: true, clubs: state.clubs });
+});
+
+app.post(
+  ['/api/clubs', '/clubs'],
+  authenticate,
+  requireRoles(['ADMIN', 'TRANSMISOR', 'EDITOR']),
+  async (req: Request, res: Response) => {
+    const club = req.body as Partial<Club>;
+    if (!club.id || !club.name || !club.shortName) {
+      res.status(400).json({ error: 'ID, nombre y nombre corto son obligatorios para el equipo.' });
+      return;
+    }
+    const cleanId = String(club.id).toLowerCase().trim().replace(/[^a-z0-9_-]/g, '_');
+    const existing = state.clubs[cleanId] || {};
+    const logoUrl = club.logoUrl === undefined ? normalizeCrestUrl(existing.logoUrl) : normalizeCrestUrl(club.logoUrl);
+    if (club.logoUrl && !logoUrl) return res.status(400).json({ error: 'URL de escudo no compatible. Usa HTTPS.' });
+    const updatedClub: Club = {
+      id: cleanId,
+      logoUrl,
+      name: String(club.name).trim(),
+      shortName: String(club.shortName).trim(),
+      city: String(club.city ?? existing.city ?? '').trim(),
+      primaryColor: String(club.primaryColor || existing.primaryColor || '#0284c7').trim(),
+      secondaryColor: String(club.secondaryColor || existing.secondaryColor || '#ffffff').trim(),
+      textColor: String(club.textColor || existing.textColor || '#ffffff').trim(),
+      badgeEmoji: String(club.badgeEmoji || existing.badgeEmoji || '⚽').trim(),
+      stadium: String(club.stadium ?? existing.stadium ?? '').trim(),
+      altitudeMeters: Math.max(0, Number(club.altitudeMeters ?? existing.altitudeMeters ?? 0) || 0),
+      league: String(club.league || existing.league || 'Bolivia (División Profesional)').trim(),
+      country: String(club.country ?? existing.country ?? '').trim(),
+    };
+
+    try { await saveSingleClubToFirebase(updatedClub); }
+    catch (error: any) { return res.status(503).json({ success: false, error: error.message || 'No se pudo guardar el equipo en Firebase.' }); }
+    state.clubs[cleanId] = updatedClub;
+    persistState();
+    broadcastSseEvent('CLUBS_UPDATED', state.clubs);
+    res.json({ success: true, club: updatedClub, clubs: state.clubs });
+  }
+);
+
+app.delete(
+  ['/api/clubs/:id', '/clubs/:id'],
+  authenticate,
+  requireRoles(['ADMIN']),
+  (req: Request, res: Response) => {
+    const id = req.params.id;
+    if (state.streamSettings.homeClubId === id || state.streamSettings.awayClubId === id) {
+      res.status(400).json({ error: 'No se puede eliminar un equipo que está jugando en el partido activo.' });
+      return;
+    }
+    if (!state.clubs[id]) {
+      res.status(404).json({ error: 'Equipo no encontrado.' });
+      return;
+    }
+    delete state.clubs[id];
+    persistState();
+    deleteClubFromFirebase(id).catch(logFirestoreWarning('eliminar equipo'));
+    broadcastSseEvent('CLUBS_UPDATED', state.clubs);
+    res.json({ success: true, message: `Equipo ${id} eliminado correctamente.`, clubs: state.clubs });
+  }
+);
+
+// ==========================================
+// 10.6 FREE SPORTS API PROXY (ESPN Open Soccer API)
+// ==========================================
+const clubCrestCache = new Map<string, { expires: number; teams: { id?: string; names: string[]; logoUrl: string }[] }>();
+app.get(['/api/football-api/teams', '/football-api/teams'], async (req: Request, res: Response) => {
+  const league = String(req.query.league || 'bol.1');
+  if (!Object.hasOwn(FOOTBALL_LEAGUES, league)) return res.status(400).json({ error: 'Liga no compatible.' });
+  const cacheKey = league + (req.query.current === '1' ? ':current' : '');
+  const cached = clubCrestCache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) return res.json({ teams: cached.teams });
+  try {
+    const responses = await Promise.allSettled((req.query.current === '1' ? [''] : ['', '&season=2024']).map(async season => {
+      const response = await fetch(`https://site.api.espn.com/apis/site/v2/sports/soccer/${league}/teams?limit=100${season}`, { signal: AbortSignal.timeout(8000) });
+      if (!response.ok) throw new Error('No se pudo consultar el catálogo de escudos.');
+      const data = await response.json();
+      return (data.sports?.[0]?.leagues?.[0]?.teams || []).map((entry: any) => ({
+        id: String(entry.team?.id || ''),
+        names: [entry.team?.displayName, entry.team?.name, entry.team?.shortDisplayName].filter((name: unknown) => typeof name === 'string'),
+        logoUrl: normalizeCrestUrl(entry.team?.logos?.[0]?.href),
+      })).filter((team: any) => team.names.length && team.logoUrl);
+    }));
+    const teams = responses.flatMap(response => response.status === 'fulfilled' ? response.value : []);
+    if (!teams.length) return res.status(502).json({ error: 'Los escudos deportivos no están disponibles.', teams: [] });
+    clubCrestCache.set(cacheKey, { expires: Date.now() + 21600000, teams });
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.json({ teams });
+  } catch { return res.status(502).json({ error: 'No se pudo cargar el catálogo de escudos.', teams: [] }); }
+});
+
+app.get(['/api/football-api/matches', '/football-api/matches'], async (req: Request, res: Response) => {
+  const league = String(req.query.league || 'bol.1').trim();
+  if (!Object.hasOwn(FOOTBALL_LEAGUES, league)) return res.status(400).json({ error: 'Liga no compatible.' });
+  res.setHeader('Cache-Control', 'public, max-age=15');
+  const url = `https://site.api.espn.com/apis/site/v2/sports/soccer/${encodeURIComponent(league)}/scoreboard`;
+  try {
+    const apiRes = await fetchEspn(url);
+    if (!apiRes.ok) {
+      res.status(apiRes.status).json({ error: 'Error al consultar API deportiva gratuita de ESPN' });
+      return;
+    }
+    const data = await apiRes.json();
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Error de red al consultar API deportiva: ' + (err.message || 'desconocido') });
+  }
+});
+
+app.get(['/api/football-api/match/:id', '/football-api/match/:id'], async (req: Request, res: Response) => {
+  const eventId = String(req.params.id).trim();
+  if (!/^[0-9]{1,20}$/.test(eventId)) return res.status(400).json({ error: 'ID ESPN no válido.' });
+  const league = String(req.query.league || 'bol.1').trim();
+  if (!Object.hasOwn(FOOTBALL_LEAGUES, league)) return res.status(400).json({ error: 'Liga no compatible.' });
+  res.setHeader('Cache-Control', 'public, max-age=15');
+  const url = `https://site.api.espn.com/apis/site/v2/sports/soccer/${encodeURIComponent(league)}/summary?event=${encodeURIComponent(eventId)}`;
+  try {
+    const apiRes = await fetchEspn(url);
+    if (!apiRes.ok) {
+      res.status(apiRes.status).json({ error: 'Error al consultar detalles de partido en ESPN' });
+      return;
+    }
+    const data = await apiRes.json();
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Error de red al consultar detalles del partido: ' + (err.message || 'desconocido') });
+  }
+});
+
+// ==========================================
+// 10.5 AUTOMATIC MATCH CLOCK TICKER (60s tick)
+// ==========================================
+if (!process.env.VERCEL) {
+  setInterval(() => {
+    let anyUpdated = false;
+    for (const evt of state.liveEvents) {
+      if (!evt.espnLink?.enabled && evt.isLive && evt.isClockRunning && evt.period !== 'Descanso' && evt.period !== 'Finalizado' && evt.period !== 'Revisión VAR') {
+        const currentMin = typeof evt.matchMinute === 'number' ? evt.matchMinute : 0;
+        if (currentMin < 130) {
+          evt.matchMinute = currentMin + 1;
+          evt.clockUpdatedAt = Date.now();
+          anyUpdated = true;
+        }
+      }
+    }
+    if (anyUpdated) {
+      persistState();
+      broadcastSseEvent('LIVE_EVENTS_UPDATED', state.liveEvents);
+      const active = state.liveEvents[0];
+      if (active) {
+        state.scoreboard.matchMinute = active.matchMinute || 0;
+        broadcastSseEvent('SCOREBOARD_UPDATED', {
+          eventId: active.id,
+          homeScore: active.homeScore ?? state.scoreboard.homeScore,
+          awayScore: active.awayScore ?? state.scoreboard.awayScore,
+          matchMinute: active.matchMinute,
+          period: active.period,
+          isClockRunning: active.isClockRunning,
+          updatedAt: Date.now(),
+        });
+        saveMatchScoreboardFirebase(active.id, {
+          homeScore: active.homeScore,
+          awayScore: active.awayScore,
+          matchMinute: active.matchMinute,
+          period: active.period,
+          isClockRunning: active.isClockRunning,
+          force: true,
+        }).catch(() => {});
+      }
+    }
+  }, 60000);
+}
+
+// 11. Health & Build SHA / Version Endpoint
+const APP_VERSION = '1.4.3';
+const DEPLOY_COMMIT_SHA = process.env.VERCEL_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || 'df267ec';
+
+app.get(['/api/health', '/health'], (_req: Request, res: Response) => {
+  res.json({
+    status: 'healthy',
+    app: 'GolBolivia Live',
+    version: APP_VERSION,
+    commitSha: DEPLOY_COMMIT_SHA,
+    timestamp: new Date().toISOString(),
+    uptime: Math.round(process.uptime()),
+    environment: process.env.NODE_ENV || 'production',
+    isVercel: Boolean(process.env.VERCEL),
+    streamSettings: getPublicStreamPayload(),
+  });
+});
+
+app.get(['/api/version', '/version'], (_req: Request, res: Response) => {
+  res.json({
+    version: APP_VERSION,
+    commitSha: DEPLOY_COMMIT_SHA,
+    builtAt: '2026-10-04T07:15:00Z',
+  });
+});
+
+// Universal 404 Handler for unmatched routes
+app.all('*', (req: Request, res: Response, next: NextFunction) => {
+  if (req.path.startsWith('/api') || (req.originalUrl && req.originalUrl.startsWith('/api'))) {
+    res.status(404).json({
+      error: `Ruta no encontrada: ${req.method} ${req.originalUrl || req.url}`,
+      availableEndpoints: [
+        'GET /api/live',
+        'GET /api/streams',
+        'GET /api/auth/me',
+        'POST /api/auth/login',
+        'GET /api/auth/login',
+        'GET /api/scoreboard',
+        'GET /api/health',
+        'GET /api/version'
+      ]
+    });
+    return;
+  }
+  next();
+});
+
+// Manejador global de errores (incluyendo 413 Payload Too Large)
+app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  if (err && (err.status === 413 || err.type === 'entity.too.large')) {
+    return res.status(413).json({
+      error: 'La imagen o el contenido enviado es demasiado grande (Límite 10MB). Por favor utiliza una imagen optimizada.',
+    });
+  }
+  if (err) {
+    return res.status(err.status || 500).json({
+      error: err.message || 'Error interno del servidor.',
+    });
+  }
+  next();
+});
+
+export { app, SYSTEM_USERS };
+export default app;

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="es" class="dark">
+  <head>
+    <script>
+      /* Ignore Vite WebSocket / HMR logs in iframe preview environment per runtime guidelines */
+      (function() {
+        if (typeof window === 'undefined') return;
+
+        function FakeHmrSocket(u, p) {
+          var t = new EventTarget();
+          this._t = t;
+          this.url = u || '';
+          this.protocol = Array.isArray(p) ? p[0] || '' : (p || '');
+          this.readyState = 1;
+          this.OPEN = 1;
+          this.CONNECTING = 0;
+          this.CLOSING = 2;
+          this.CLOSED = 3;
+          this.bufferedAmount = 0;
+          this.extensions = '';
+          this.binaryType = 'blob';
+          this.onopen = null;
+          this.onmessage = null;
+          this.onerror = null;
+          this.onclose = null;
+        }
+        FakeHmrSocket.prototype.OPEN = 1;
+        FakeHmrSocket.prototype.CONNECTING = 0;
+        FakeHmrSocket.prototype.CLOSING = 2;
+        FakeHmrSocket.prototype.CLOSED = 3;
+        FakeHmrSocket.prototype.addEventListener = function(y, l, o) {
+          return this._t.addEventListener(y, l, o);
+        };
+        FakeHmrSocket.prototype.removeEventListener = function(y, l, o) {
+          return this._t.removeEventListener(y, l, o);
+        };
+        FakeHmrSocket.prototype.dispatchEvent = function(e) {
+          return this._t.dispatchEvent(e);
+        };
+        FakeHmrSocket.prototype.send = function() {};
+        FakeHmrSocket.prototype.close = function() {};
+
+        if (window.WebSocket) {
+          var _OWS = window.WebSocket;
+          window.WebSocket = function(u, p) {
+            var h = false;
+            var s = typeof u === 'string' ? u : (u && u.href ? u.href : '');
+            if (p === 'vite-hmr' || (Array.isArray(p) && p.indexOf('vite-hmr') !== -1)) h = true;
+            if (s.indexOf('vite') !== -1 || s.indexOf('token=') !== -1 || s.indexOf('3000') !== -1 || s.indexOf('24678') !== -1) h = true;
+            if (h) return new FakeHmrSocket(s, p);
+            return new _OWS(u, p);
+          };
+          window.WebSocket.prototype = _OWS.prototype;
+          window.WebSocket.CONNECTING = _OWS.CONNECTING;
+          window.WebSocket.OPEN = _OWS.OPEN;
+          window.WebSocket.CLOSING = _OWS.CLOSING;
+          window.WebSocket.CLOSED = _OWS.CLOSED;
+        }
+
+        var _isV = function(m) {
+          if (!m) return false;
+          var s = typeof m === 'string' ? m : (m.message || (m.stack ? m.stack : '') || String(m) || '');
+          return s.indexOf('[vite]') !== -1 ||
+                 s.indexOf('WebSocket') !== -1 ||
+                 s.indexOf('websocket') !== -1 ||
+                 s.indexOf('createWebSocketModuleRunnerTransport') !== -1 ||
+                 s.indexOf('closed without opened') !== -1;
+        };
+
+        ['error', 'warn', 'info', 'log', 'debug'].forEach(function(m) {
+          var o = console[m];
+          console[m] = function() {
+            for (var i = 0; i < arguments.length; i++) {
+              if (_isV(arguments[i])) return;
+            }
+            return o.apply(console, arguments);
+          };
+        });
+
+        window.addEventListener('error', function(e) {
+          if (e && (_isV(e.message) || _isV(e.error) || (e.filename && e.filename.indexOf('@vite/client') !== -1))) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', function(e) {
+          if (e && (_isV(e.reason) || (e.reason && e.reason.stack && _isV(e.reason.stack)))) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+      })();
+    </script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>GolBolivia Live — Transmisión en Vivo del Fútbol Boliviano</title>
+    <meta name="description" content="Mira la División Profesional del Fútbol Boliviano en vivo en HD con chat en tiempo real, múltiples resoluciones, estadísticas oficiales y contenido exclusivo de clubes." />
+    <link rel="canonical" href="https://golbolivialive-beta.vercel.app/" />
+
+    <!-- Favicon & PWA Icons -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/pwa-192x192.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.json" />
+
+    <!-- Open Graph / Facebook / WhatsApp -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://golbolivialive-beta.vercel.app/" />
+    <meta property="og:title" content="GolBolivia Live — Transmisión en Vivo del Fútbol Boliviano" />
+    <meta property="og:description" content="Mira la División Profesional del Fútbol Boliviano en vivo en HD con chat en tiempo real, múltiples resoluciones, estadísticas oficiales y contenido exclusivo de clubes." />
+    <meta property="og:image" content="https://golbolivialive-beta.vercel.app/favicon.svg" />
+    <meta property="og:site_name" content="GolBolivia Live" />
+    <meta property="og:locale" content="es_BO" />
+
+    <!-- Twitter / X -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:url" content="https://golbolivialive-beta.vercel.app/" />
+    <meta name="twitter:title" content="GolBolivia Live — Transmisión en Vivo del Fútbol Boliviano" />
+    <meta name="twitter:description" content="Streaming en vivo del fútbol boliviano con chat en tiempo real y estadísticas oficiales." />
+    <meta name="twitter:image" content="https://golbolivialive-beta.vercel.app/favicon.svg" />
+
+    <!-- Mobile Navigation & Theme Color -->
+    <meta name="theme-color" content="#070b14" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="GolBolivia" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+    <!-- Official Google Cast Web Sender SDK for Smart TV / Chromecast -->
+    <script>
+      window['__onGCastApiAvailable'] = function(isAvailable) {
+        window.__isGCastApiAvailable = Boolean(isAvailable);
+        if (isAvailable) {
+          window.dispatchEvent(new CustomEvent('google-cast-api-available', { detail: { isAvailable: true } }));
+        }
+      };
+    </script>
+    <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
+    <!-- Universal HLS.js Player Engine CDN Fallback -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  </head>
+  <body class="bg-[#070b14] text-slate-100 antialiased selection:bg-emerald-500 selection:text-black">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

@@ -1,0 +1,336 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { StreamResolution, StreamSettings } from '../../types/football';
+import { BOLIVIAN_CLUBS } from '../../data/bolivianFootballData';
+import { useFullscreen } from './hooks/useFullscreen';
+import { useCast } from './hooks/useCast';
+import { useHls } from './hooks/useHls';
+import { useStreamRecovery } from './hooks/useStreamRecovery';
+import { usePlayerTelemetry } from './hooks/usePlayerTelemetry';
+import { normalizeExternalPlayerUrl } from '../../utils/streamUtils';
+import { VideoSurface } from './VideoSurface';
+import { PlayerControls } from './PlayerControls';
+import { QualitySelector } from './QualitySelector';
+import { AudioSelector } from './AudioSelector';
+import { CastController } from './CastController';
+import { StreamStats } from './StreamStats';
+
+export interface StreamPlayerProps {
+  isTheaterMode?: boolean;
+  setIsTheaterMode?: (val: boolean | ((prev: boolean) => boolean)) => void;
+  openObsModal?: () => void;
+  triggerReaction?: (emoji: string) => void;
+  homeScore?: number;
+  awayScore?: number;
+  matchMinute?: number;
+  streamSettings?: StreamSettings;
+  viewerCount?: number;
+  onHlsPlaying?: () => void;
+  matchStatusLabel?: string;
+}
+
+export const StreamPlayer: React.FC<StreamPlayerProps> = ({
+  isTheaterMode = false,
+  setIsTheaterMode = () => {},
+  openObsModal = () => {},
+  triggerReaction = () => {},
+  homeScore = 0,
+  awayScore = 0,
+  matchMinute = 0,
+  streamSettings,
+  viewerCount = 0,
+  onHlsPlaying,
+  matchStatusLabel,
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  // Playback state (audio activo por defecto para transmisiones)
+  const [isPlaying, setIsPlaying] = useState<boolean>(true);
+  const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [volume, setVolume] = useState<number>(0.85);
+
+  // Settings & popovers state
+  const [currentResolution, setCurrentResolution] = useState<StreamResolution>('auto');
+  const [latencyMode, setLatencyMode] = useState<'ultra-low' | 'standard'>('ultra-low');
+  const [audioTrack, setAudioTrack] = useState<'oficial' | 'radio' | 'ambiente'>('oficial');
+  const [cameraAngle, setCameraAngle] = useState<'principal' | 'arco' | 'tactica' | 'ras_piso'>('principal');
+
+  const [showQualityMenu, setShowQualityMenu] = useState<boolean>(false);
+  const [showAudioMenu, setShowAudioMenu] = useState<boolean>(false);
+  const [showStatsOverlay, setShowStatsOverlay] = useState<boolean>(false);
+  const [showControls, setShowControls] = useState<boolean>(true);
+  const [isCleanScreen, setIsCleanScreen] = useState<boolean>(false);
+
+  const hideControlsTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Custom Fullscreen Hook with auto landscape rotation
+  const { isFullscreen, toggleFullscreen } = useFullscreen(containerRef, videoRef);
+
+  const effectiveSrc = streamSettings?.activeStreamSource === 'backup'
+    ? (streamSettings?.backupVideoUrl || streamSettings?.customVideoUrl)
+    : (streamSettings?.activeStreamSource === 'simulation' ? '' : (streamSettings?.customVideoUrl || streamSettings?.backupVideoUrl));
+
+  const isExternalPlayer = Boolean(normalizeExternalPlayerUrl(effectiveSrc));
+
+  // Custom Cast Hook for Smart TV, Chromecast and AirPlay
+  const {
+    castStatus,
+    castError,
+    castDevice,
+    isAirPlayAvailable,
+    isRemotePlaybackAvailable,
+    showCastModal,
+    setShowCastModal,
+    startCast,
+    triggerAirPlay,
+    triggerRemotePlayback,
+    disconnectCast,
+  } = useCast(
+    streamSettings?.title || 'Transmisión Oficial GolBolivia',
+    effectiveSrc,
+    videoRef
+  );
+
+  const {
+    isReconnecting,
+    streamError,
+    setStreamError,
+    resetRecovery,
+  } = useStreamRecovery();
+
+  const handleReloadStream = () => {
+    resetRecovery();
+    retryHls();
+  };
+
+  useEffect(() => {
+    resetRecovery();
+  }, [effectiveSrc, streamSettings?.backupVideoUrl, resetRecovery]);
+
+  const [failoverBanner, setFailoverBanner] = useState<string | null>(null);
+
+  const handleHlsError = useCallback((err: string) => {
+    setStreamError(err);
+  }, [setStreamError]);
+
+  const handleHlsSuccess = useCallback(() => {
+    resetRecovery();
+    onHlsPlaying?.();
+  }, [resetRecovery, onHlsPlaying]);
+
+  const handleHlsFailover = useCallback((source: 'backup' | 'primary') => {
+    if (source === 'backup') {
+      setFailoverBanner(
+        streamSettings?.backupChannelName
+          ? `Señal conmutada a respaldo: ${streamSettings.backupChannelName}`
+          : 'Señal conmutada a transmisión alternativa de respaldo.'
+      );
+      setTimeout(() => setFailoverBanner(null), 8000);
+    } else {
+      setFailoverBanner(null);
+    }
+  }, [streamSettings?.backupChannelName]);
+
+  const { isLoaded, changeLevel, hlsInstance, isUsingBackup, retry: retryHls } = useHls({
+    videoRef,
+    src: effectiveSrc,
+    backupSrc: streamSettings?.backupVideoUrl,
+    autoFailover: streamSettings?.autoFailoverEnabled !== false,
+    autoplay: isPlaying,
+    onError: handleHlsError,
+    onSuccess: handleHlsSuccess,
+    onFailoverTriggered: handleHlsFailover,
+  });
+
+  const telemetry = usePlayerTelemetry({
+    videoRef,
+    hlsInstance,
+    isPlaying,
+    currentResolutionSetting: currentResolution,
+    isLiveSignal: Boolean(streamSettings?.customVideoUrl),
+  });
+
+  // Sync volume with video element
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.volume = volume;
+      videoRef.current.muted = isMuted;
+    }
+  }, [volume, isMuted]);
+
+  // Controls auto-hide timeout
+  const resetControlsTimeout = useCallback(() => {
+    setShowControls(true);
+    setIsCleanScreen(false);
+    if (hideControlsTimerRef.current) {
+      clearTimeout(hideControlsTimerRef.current);
+    }
+    if (isPlaying && !showQualityMenu && !showAudioMenu && !showStatsOverlay) {
+      hideControlsTimerRef.current = setTimeout(() => {
+        setShowControls(false);
+      }, 3500);
+    }
+  }, [isPlaying, showQualityMenu, showAudioMenu, showStatsOverlay]);
+
+  // Single tap handler (toggles overlay visibility cleanly without pausing)
+  const handleSingleTap = useCallback(() => {
+    if (!showControls || isCleanScreen) {
+      resetControlsTimeout();
+    } else {
+      setShowControls(false);
+      setIsCleanScreen(true);
+      if (hideControlsTimerRef.current) {
+        clearTimeout(hideControlsTimerRef.current);
+      }
+    }
+  }, [showControls, isCleanScreen, resetControlsTimeout]);
+
+  // Toggle clean screen mode directly
+  const handleToggleCleanScreen = useCallback(() => {
+    setIsCleanScreen((prev) => {
+      const next = !prev;
+      setShowControls(!next);
+      return next;
+    });
+  }, []);
+
+  const handleTogglePlay = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const video = videoRef.current;
+    if (video) {
+      if (!video.paused) {
+        video.pause();
+        setIsPlaying(false);
+      } else {
+        video.play().catch(() => {});
+        setIsPlaying(true);
+      }
+    } else {
+      setIsPlaying((prev) => !prev);
+    }
+    resetControlsTimeout();
+  };
+
+  const handleToggleMute = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setIsMuted((prev) => !prev);
+  };
+
+  const handleChangeVolume = (val: number) => {
+    setVolume(val);
+    if (val > 0 && isMuted) {
+      setIsMuted(false);
+    }
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      onMouseMove={resetControlsTimeout}
+      onMouseEnter={resetControlsTimeout}
+      className={`relative w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl border border-slate-800 transition-all ${
+        isFullscreen ? 'rounded-none border-none' : ''
+      }`}
+    >
+      {/* Video Surface (Video Tag or Simulation Canvas) with Double-Tap to Pause */}
+      <VideoSurface
+        videoRef={videoRef}
+        streamSettings={streamSettings}
+        isPlaying={isPlaying}
+        isMuted={isMuted}
+        onTogglePlay={handleTogglePlay}
+        isReconnecting={isReconnecting}
+        streamError={streamError}
+        onReloadStream={handleReloadStream}
+        homeScore={homeScore}
+        awayScore={awayScore}
+        matchMinute={matchMinute}
+        showControls={showControls}
+        onSingleTap={handleSingleTap}
+        isCleanScreen={isCleanScreen}
+      />
+
+
+
+      {/* Popovers */}
+      <QualitySelector
+        isOpen={showQualityMenu}
+        onClose={() => setShowQualityMenu(false)}
+        currentResolution={currentResolution}
+        onSelectResolution={setCurrentResolution}
+        latencyMode={latencyMode}
+        onToggleLatencyMode={() => setLatencyMode((m) => (m === 'ultra-low' ? 'standard' : 'ultra-low'))}
+        onToggleStats={() => setShowStatsOverlay((s) => !s)}
+        showStatsOverlay={showStatsOverlay}
+      />
+
+      <AudioSelector
+        isOpen={showAudioMenu}
+        onClose={() => setShowAudioMenu(false)}
+        audioTrack={audioTrack}
+        onSelectAudioTrack={setAudioTrack}
+        cameraAngle={cameraAngle}
+        onSelectCameraAngle={setCameraAngle}
+      />
+
+      <StreamStats
+        isOpen={showStatsOverlay}
+        onClose={() => setShowStatsOverlay(false)}
+        telemetry={telemetry}
+        isLiveSignal={Boolean(streamSettings?.customVideoUrl)}
+        audioTrack={audioTrack}
+      />
+
+      {/* Player Controls Bar */}
+      {!isExternalPlayer && <PlayerControls
+        matchStatusLabel={matchStatusLabel}
+        isPlaying={isPlaying}
+        onTogglePlay={handleTogglePlay}
+        isMuted={isMuted}
+        volume={volume}
+        onToggleMute={handleToggleMute}
+        onChangeVolume={handleChangeVolume}
+        showControls={showControls}
+        onControlsInteraction={resetControlsTimeout}
+        isFullscreen={isFullscreen}
+        onToggleFullscreen={toggleFullscreen}
+        isTheaterMode={isTheaterMode}
+        onToggleTheaterMode={() => setIsTheaterMode((t) => !t)}
+        showAudioMenu={showAudioMenu}
+        onToggleAudioMenu={() => {
+          setShowAudioMenu((prev) => !prev);
+          setShowQualityMenu(false);
+        }}
+        showQualityMenu={showQualityMenu}
+        onToggleQualityMenu={() => {
+          setShowQualityMenu((prev) => !prev);
+          setShowAudioMenu(false);
+        }}
+        onOpenCastModal={startCast}
+        onReloadStream={handleReloadStream}
+        currentResolution={currentResolution}
+        triggerReaction={triggerReaction}
+        viewerCount={viewerCount}
+        isCleanScreen={isCleanScreen}
+        onToggleCleanScreen={handleToggleCleanScreen}
+      />}
+
+      {/* Cast Modal */}
+      <CastController
+        isOpen={showCastModal}
+        onClose={() => setShowCastModal(false)}
+        castStatus={castStatus}
+        castDevice={castDevice}
+        castError={castError}
+        onDisconnect={disconnectCast}
+        streamTitle={streamSettings?.title || 'Transmisión Oficial GolBolivia'}
+        streamUrl={effectiveSrc}
+        isAirPlayAvailable={isAirPlayAvailable}
+        onTriggerAirPlay={triggerAirPlay}
+        isRemotePlaybackAvailable={isRemotePlaybackAvailable}
+        onTriggerRemotePlayback={triggerRemotePlayback}
+        onStartCast={startCast}
+      />
+    </div>
+  );
+};

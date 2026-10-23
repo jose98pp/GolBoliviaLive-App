@@ -1,0 +1,22 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.vercel/
+.antigravity/
+.vscode/
+.agents/
+
+
+# Estado local del servidor en la raíz (contiene stream key y URLs privadas)
+/data/
+!src/data/
+
+# Local Firebase Emulator logs
+**/firebase-debug.log
+**/firestore-debug.log
+**/ui-debug.log

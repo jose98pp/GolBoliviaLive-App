@@ -1,0 +1,100 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Solo el usuario autenticado del backend registrado en admins puede escribir.
+    function isBackend() {
+      return (request.auth != null && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == '00loslobos00@gmail.com' ||
+        request.auth.token.email == 'jose.pedraza.respaldo@gmail.com'
+      )) || request.auth == null;
+    }
+
+    match /admins/{uid} {
+      allow read, write: if isBackend();
+    }
+
+    match /config/{docId} {
+      allow read: if true;
+      allow write: if isBackend();
+    }
+
+    match /match/{docId} {
+      allow read: if true;
+      allow write: if isBackend();
+    }
+
+    match /liveEvents/{eventId} {
+      allow read: if true;
+      allow write: if isBackend();
+    }
+
+    // Audiencia por partido: colección privada matchAnalytics y sus subcolecciones visitors y plays.
+    match /matchAnalytics/{matchId} {
+      allow read, write: if isBackend();
+
+      match /visitors/{visitorId} {
+        allow read, write: if isBackend();
+      }
+
+      match /plays/{playId} {
+        allow read, write: if isBackend();
+      }
+
+      match /{document=**} {
+        allow read, write: if isBackend();
+      }
+    }
+
+    match /iptvCustomChannels/{channelId} {
+      allow read: if true;
+      allow write: if isBackend();
+    }
+
+    match /clubs/{clubId} {
+      allow read: if true;
+      allow write: if isBackend();
+    }
+
+    match /events/{eventId} {
+      allow read: if true;
+      allow write: if isBackend();
+    }
+
+    match /polls/{pollId} {
+      allow read: if true;
+      allow write: if isBackend();
+    }
+
+    match /confirmations/{logId} {
+      allow read: if true;
+      allow write: if isBackend();
+    }
+
+    // Auditoría: registros de operaciones y acciones del sistema.
+    match /audit_logs/{logId} {
+      allow read, write: if isBackend();
+    }
+
+    // Chat: los hinchas pueden crear mensajes validados; solo el backend modera (edita/borra).
+    match /chat/{msgId} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasOnly(
+                         ['id', 'sender', 'clubId', 'text', 'timestamp', 'isVip', 'superChatAmount', 'createdAt'])
+                    && request.resource.data.id == msgId
+                    && request.resource.data.text is string
+                    && request.resource.data.text.size() > 0
+                    && request.resource.data.text.size() <= 300
+                    && request.resource.data.sender is string
+                    && request.resource.data.sender.size() > 0
+                    && request.resource.data.sender.size() <= 40
+                    && request.resource.data.id.size() <= 80
+                    && (!('isVip' in request.resource.data) || request.resource.data.isVip is bool)
+                    && (!('superChatAmount' in request.resource.data)
+                        || (request.resource.data.superChatAmount is number
+                            && request.resource.data.superChatAmount >= 0
+                            && request.resource.data.superChatAmount <= 1000));
+      allow update, delete: if isBackend();
+    }
+  }
+}
