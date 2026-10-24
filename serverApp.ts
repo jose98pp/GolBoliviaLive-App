@@ -84,6 +84,25 @@ app.all(['/api/proxy', '/proxy'], async (req: Request, res: Response) => {
   await proxyHandler(req, res);
 });
 
+// 6. Endpoints públicos para sincronización de datos de Firebase Firestore
+app.get('/api/live-events', async (_req: Request, res: Response) => {
+  try {
+    const events = await getLiveEventsFromFirebase();
+    res.json(events);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Error fetching live events from Firestore', details: err?.message });
+  }
+});
+
+app.get('/api/stream-settings', async (_req: Request, res: Response) => {
+  try {
+    const settings = await getStreamSettingsFromFirebase();
+    res.json(settings);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Error fetching stream settings from Firestore', details: err?.message });
+  }
+});
+
 // ── Secrets & operator accounts (SOLO por variables de entorno; sin valores por defecto) ──
 const DEFAULT_SERVER_SECRET = 'golbolivia-master-secret-key-super-secure-session-tokens-2026-auth-prod-signature';
 const SERVER_SECRET: string = (() => {

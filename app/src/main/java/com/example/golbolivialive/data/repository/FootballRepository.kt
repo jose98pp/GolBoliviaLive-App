@@ -12,6 +12,10 @@ import java.util.*
 
 class FootballRepository {
 
+    private val firestoreRepo = FirestoreMatchRepository()
+    val allMatches: StateFlow<List<LiveMatch>> = firestoreRepo.matches
+    val isSyncingFirestore: StateFlow<Boolean> = firestoreRepo.isSyncing
+
     private val _liveMatch = MutableStateFlow(BolivianFootballData.getDefaultLiveMatch())
     val liveMatch: StateFlow<LiveMatch> = _liveMatch.asStateFlow()
 
@@ -29,6 +33,20 @@ class FootballRepository {
 
     private val _favoriteChannelIds = MutableStateFlow(setOf("claro-sports-latam", "redbull-tv-live", "fifa-plus-es"))
     val favoriteChannelIds: StateFlow<Set<String>> = _favoriteChannelIds.asStateFlow()
+
+    suspend fun syncFirestore() {
+        firestoreRepo.syncFromFirestore()
+        // If current match exists in new matches, keep it updated
+        val updated = firestoreRepo.matches.value.find { it.id == _liveMatch.value.id }
+        if (updated != null) {
+            _liveMatch.value = updated
+        }
+    }
+
+    fun selectMatch(match: LiveMatch) {
+        firestoreRepo.selectMatch(match)
+        _liveMatch.value = match
+    }
 
     fun switchMatchSignal(signal: SignalSource) {
         _liveMatch.update { it.copy(activeSignal = signal) }

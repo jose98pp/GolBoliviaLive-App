@@ -8,6 +8,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -27,6 +28,8 @@ fun LiveMatchScreen(
     modifier: Modifier = Modifier
 ) {
     val match by viewModel.liveMatch.collectAsState()
+    val allMatches by viewModel.allMatches.collectAsState()
+    val isSyncingFirestore by viewModel.isSyncingFirestore.collectAsState()
     val chatMessages by viewModel.chatMessages.collectAsState()
     val livePoll by viewModel.livePoll.collectAsState()
     val isReloading by viewModel.isReloadingSignal.collectAsState()
@@ -53,10 +56,12 @@ fun LiveMatchScreen(
             .background(StadiumDark)
             .testTag("live_match_screen")
     ) {
-        // Video Player Surface
+        // Video Player Surface (Apple TV Spotlight Hero)
         VideoPlayerSurface(
             streamUrl = currentStreamUrl,
             signalTitle = "${match.activeSignal.label} (${match.activeSignal.badge})",
+            homeClubShortName = match.homeClub.shortName,
+            awayClubShortName = match.awayClub.shortName,
             isLive = match.isLive,
             onReload = { viewModel.reloadSignal() }
         )
@@ -68,6 +73,15 @@ fun LiveMatchScreen(
             onSelectSignal = { viewModel.switchMatchSignal(it) },
             onReloadSignal = { viewModel.reloadSignal() },
             onOpenAudience = { viewModel.openAudienceModal() }
+        )
+
+        // Apple TV Style Horizontal Match Carousel (Dual-color club cards)
+        AppleTvMatchCarousel(
+            matches = allMatches,
+            selectedMatchId = match.id,
+            isSyncing = isSyncingFirestore,
+            onSelectMatch = { selected -> viewModel.selectMatch(selected) },
+            onSyncNow = { viewModel.syncFirestore() }
         )
 
         // Sub-navigation Tab Row (Chat, Stats, Events, Poll)

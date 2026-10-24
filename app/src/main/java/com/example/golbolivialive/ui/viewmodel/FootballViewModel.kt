@@ -13,12 +13,28 @@ class FootballViewModel(
     private val repository: FootballRepository = FootballRepository()
 ) : ViewModel() {
 
+    val allMatches: StateFlow<List<LiveMatch>> = repository.allMatches
     val liveMatch: StateFlow<LiveMatch> = repository.liveMatch
+    val isSyncingFirestore: StateFlow<Boolean> = repository.isSyncingFirestore
     val chatMessages: StateFlow<List<ChatMessage>> = repository.chatMessages
     val livePoll: StateFlow<LivePoll> = repository.livePoll
     val iptvChannels: StateFlow<List<IptvChannel>> = repository.iptvChannels
     val activeIptvChannel: StateFlow<IptvChannel?> = repository.activeIptvChannel
     val favoriteChannelIds: StateFlow<Set<String>> = repository.favoriteChannelIds
+
+    init {
+        syncFirestore()
+    }
+
+    fun syncFirestore() {
+        viewModelScope.launch {
+            repository.syncFirestore()
+        }
+    }
+
+    fun selectMatch(match: LiveMatch) {
+        repository.selectMatch(match)
+    }
 
     private val _selectedIptvCountry = MutableStateFlow("ALL")
     val selectedIptvCountry: StateFlow<String> = _selectedIptvCountry.asStateFlow()

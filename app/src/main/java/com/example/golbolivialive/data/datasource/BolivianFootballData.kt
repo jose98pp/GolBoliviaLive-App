@@ -192,6 +192,96 @@ object BolivianFootballData {
         )
     }
 
+    fun getRoundMatches(): List<LiveMatch> {
+        val defaultMatch = getDefaultLiveMatch()
+
+        val match2 = LiveMatch(
+            id = "blooming_vs_oriente",
+            title = "Clásico Cruceño: Blooming vs Oriente Petrolero",
+            tournamentName = "División Profesional — Torneo Clausura",
+            homeClub = CLUBS["blooming"]!!,
+            awayClub = CLUBS["oriente"]!!,
+            homeScore = 1,
+            awayScore = 1,
+            matchMinute = 38,
+            period = "1T",
+            isLive = true,
+            stadiumName = "Estadio Ramón Tahuichi Aguilera",
+            altitudeMeters = 416,
+            officialAnnouncement = "🔥 Intenso clásico en Santa Cruz con estadio lleno y goles tempraneros.",
+            activeSignal = SignalSource.PRINCIPAL_HD,
+            hlsUrlPrincipal = "https://live-clarosports-linear.amagi.tv/playlist.m3u8",
+            hlsUrlBackup = "https://rbmn-live.akamaized.net/hls/live/590964/BoRB-AT/master.m3u8",
+            hlsUrlDemo = "https://amg01269-amg01269c1-fifa-intl-4066.playouts.now.amagi.tv/playlist/amg01269-fifaplusfast-fifaplus-fifaplusintl/playlist.m3u8",
+            connectedFans = 1890
+        )
+
+        val match3 = LiveMatch(
+            id = "wilstermann_vs_aurora",
+            title = "Clásico Cochabambino: Wilstermann vs Aurora",
+            tournamentName = "División Profesional — Torneo Clausura",
+            homeClub = CLUBS["wilstermann"]!!,
+            awayClub = CLUBS["aurora"]!!,
+            homeScore = 0,
+            awayScore = 0,
+            matchMinute = 15,
+            period = "1T",
+            isLive = true,
+            stadiumName = "Estadio Félix Capriles",
+            altitudeMeters = 2558,
+            officialAnnouncement = "⚔️ Wilstermann y Aurora disputan el dominio del Félix Capriles.",
+            activeSignal = SignalSource.PRINCIPAL_HD,
+            hlsUrlPrincipal = "https://live-clarosports-linear.amagi.tv/playlist.m3u8",
+            hlsUrlBackup = "https://rbmn-live.akamaized.net/hls/live/590964/BoRB-AT/master.m3u8",
+            hlsUrlDemo = "https://amg01269-amg01269c1-fifa-intl-4066.playouts.now.amagi.tv/playlist/amg01269-fifaplusfast-fifaplus-fifaplusintl/playlist.m3u8",
+            connectedFans = 1430
+        )
+
+        val match4 = LiveMatch(
+            id = "always_vs_nacional",
+            title = "Duelo de la Altura: Always Ready vs Nacional Potosí",
+            tournamentName = "División Profesional — Fecha 22",
+            homeClub = CLUBS["always"]!!,
+            awayClub = CLUBS["nacional"]!!,
+            homeScore = 0,
+            awayScore = 0,
+            matchMinute = 0,
+            period = "Hoy 19:30",
+            isLive = false,
+            stadiumName = "Estadio Municipal de Villa Ingenio (El Alto)",
+            altitudeMeters = 4083,
+            officialAnnouncement = "🏔️ Fútbol a más de 4,000 metros de altura en Villa Ingenio.",
+            activeSignal = SignalSource.PRINCIPAL_HD,
+            hlsUrlPrincipal = "https://live-clarosports-linear.amagi.tv/playlist.m3u8",
+            hlsUrlBackup = "https://rbmn-live.akamaized.net/hls/live/590964/BoRB-AT/master.m3u8",
+            hlsUrlDemo = "https://amg01269-amg01269c1-fifa-intl-4066.playouts.now.amagi.tv/playlist/amg01269-fifaplusfast-fifaplus-fifaplusintl/playlist.m3u8",
+            connectedFans = 870
+        )
+
+        val match5 = LiveMatch(
+            id = "san_antonio_vs_tomayapo",
+            title = "San Antonio Bulo Bulo vs Real Tomayapo",
+            tournamentName = "División Profesional — Fecha 22",
+            homeClub = CLUBS["san_antonio"]!!,
+            awayClub = CLUBS["tomayapo"]!!,
+            homeScore = 0,
+            awayScore = 0,
+            matchMinute = 0,
+            period = "Mañana 15:00",
+            isLive = false,
+            stadiumName = "Estadio Carlos Villegas (Entre Ríos)",
+            altitudeMeters = 250,
+            officialAnnouncement = "🌴 San Antonio busca afianzarse en el trópico cochabambino.",
+            activeSignal = SignalSource.PRINCIPAL_HD,
+            hlsUrlPrincipal = "https://live-clarosports-linear.amagi.tv/playlist.m3u8",
+            hlsUrlBackup = "https://rbmn-live.akamaized.net/hls/live/590964/BoRB-AT/master.m3u8",
+            hlsUrlDemo = "https://amg01269-amg01269c1-fifa-intl-4066.playouts.now.amagi.tv/playlist/amg01269-fifaplusfast-fifaplus-fifaplusintl/playlist.m3u8",
+            connectedFans = 620
+        )
+
+        return listOf(defaultMatch, match2, match3, match4, match5)
+    }
+
     val INITIAL_CHAT_MESSAGES = listOf(
         ChatMessage("m1", "Carlos_LaPaz", "bolivar", "¡Qué golazo de Ramiro Vaca por favor! De tiro libre es letal 🔥", "18:42", isVip = true),
         ChatMessage("m2", "TigreDeCorazon", "strongest", "Todavía falta un montón, vamos The Strongest con garra 🐯💪", "18:43"),

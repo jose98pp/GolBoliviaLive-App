@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -27,16 +29,23 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import com.example.golbolivialive.ui.theme.EmeraldLive
 import com.example.golbolivialive.ui.theme.StadiumDark
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.InetAddress
 
 @OptIn(UnstableApi::class)
 @Composable
 fun VideoPlayerSurface(
     streamUrl: String,
     signalTitle: String,
+    homeClubShortName: String = "Bolívar",
+    awayClubShortName: String = "The Strongest",
     isLive: Boolean = true,
     onReload: () -> Unit,
     modifier: Modifier = Modifier
@@ -46,12 +55,24 @@ fun VideoPlayerSurface(
     var isPlaying by remember { mutableStateOf(true) }
     var isMuted by remember { mutableStateOf(false) }
     var hasError by remember { mutableStateOf(false) }
+    var reloadTrigger by remember { mutableIntStateOf(0) }
 
     val exoPlayer = remember(context) {
-        ExoPlayer.Builder(context).build().apply {
-            playWhenReady = true
-            repeatMode = Player.REPEAT_MODE_OFF
-        }
+        val httpDataSource = DefaultHttpDataSource.Factory()
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(8000)
+            .setReadTimeoutMs(8000)
+            .setUserAgent("GolBoliviaLive/1.0 (Android; Mobile)")
+
+        val mediaSourceFactory = DefaultMediaSourceFactory(context)
+            .setDataSourceFactory(httpDataSource)
+
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build().apply {
+                playWhenReady = true
+                repeatMode = Player.REPEAT_MODE_OFF
+            }
     }
 
     DisposableEffect(exoPlayer) {
@@ -68,6 +89,9 @@ fun VideoPlayerSurface(
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                // Prevent further retries on dead host
+                exoPlayer.stop()
+                exoPlayer.clearMediaItems()
                 hasError = true
                 isBuffering = false
             }
@@ -79,10 +103,38 @@ fun VideoPlayerSurface(
         }
     }
 
-    // React to streamUrl changes
-    LaunchedEffect(streamUrl) {
+    // React to streamUrl changes with network pre-check
+    LaunchedEffect(streamUrl, reloadTrigger) {
         hasError = false
         isBuffering = true
+
+        // Verify DNS / host reachability before asking ExoPlayer to prepare
+        val canReachHost = withContext(Dispatchers.IO) {
+            try {
+                val uri = Uri.parse(streamUrl)
+                val host = uri.host
+                if (host.isNullOrBlank()) {
+                    false
+                } else if (host == "localhost" || host == "127.0.0.1" || host == "10.0.2.2") {
+                    true
+                } else {
+                    val address = InetAddress.getByName(host)
+                    address != null
+                }
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        if (!canReachHost) {
+            // Offline or emulator sandbox without external WAN: switch to 2D Pitch Radar smoothly
+            exoPlayer.stop()
+            exoPlayer.clearMediaItems()
+            hasError = true
+            isBuffering = false
+            return@LaunchedEffect
+        }
+
         try {
             val mediaItem = MediaItem.fromUri(Uri.parse(streamUrl))
             exoPlayer.setMediaItem(mediaItem)
@@ -101,19 +153,31 @@ fun VideoPlayerSurface(
             .background(StadiumDark)
             .testTag("video_player_surface")
     ) {
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply {
-                    player = exoPlayer
-                    useController = false
-                    layoutParams = android.view.ViewGroup.LayoutParams(
-                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                        android.view.ViewGroup.LayoutParams.MATCH_PARENT
-                    )
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+        if (!hasError) {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        player = exoPlayer
+                        useController = false
+                        layoutParams = android.view.ViewGroup.LayoutParams(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            InteractivePitchRadar(
+                homeClubShortName = homeClubShortName,
+                awayClubShortName = awayClubShortName,
+                onRetryStream = {
+                    reloadTrigger++
+                    onReload()
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         // Overlay top bar: Live badge & Signal info
         Row(
@@ -181,7 +245,7 @@ fun VideoPlayerSurface(
                         .testTag("player_mute_button")
                 ) {
                     Icon(
-                        imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                        imageVector = if (isMuted) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp,
                         contentDescription = "Audio",
                         tint = Color.White,
                         modifier = Modifier.size(18.dp)
@@ -226,52 +290,6 @@ fun VideoPlayerSurface(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium
                     )
-                }
-            }
-        }
-
-        // Error message & retry
-        if (hasError) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.85f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Warning,
-                        contentDescription = "Alerta",
-                        tint = Color(0xFFEF4444),
-                        modifier = Modifier.size(36.dp)
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Señal en reconexión o enlace alternativo",
-                        color = Color.White,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Pulsa recargar para restablecer la transmisión",
-                        color = Color.LightGray,
-                        fontSize = 12.sp
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = onReload,
-                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldLive),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.testTag("retry_signal_button")
-                    ) {
-                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Reintentar")
-                    }
                 }
             }
         }
